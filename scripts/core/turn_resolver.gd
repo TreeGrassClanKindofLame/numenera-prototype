@@ -3,11 +3,6 @@ extends RefCounted
 const TurnIntentType = preload("res://scripts/model/turn_intent.gd")
 const TurnResolutionType = preload("res://scripts/model/turn_resolution.gd")
 
-const STATUS_PENDING := &"pending"
-const STATUS_SUCCESS := &"success"
-const STATUS_FAILED := &"failed"
-const STATUS_WAITING := &"waiting"
-
 const VALID_DELTAS := [
 	Vector2i.UP,
 	Vector2i.DOWN,
@@ -22,142 +17,413 @@ static func resolve(
 	actor_states: Array,
 	intents: Dictionary
 ):
-	var positions: Dictionary = {}
-	var occupancy: Dictionary = {}
+	var states: Dictionary = {}
 	var actor_ids: Array = []
+	var initial_positions: Dictionary = {}
+	var current_positions: Dictionary = {}
+	var last_sources: Dictionary = {}
+	var valid_movers: Dictionary = {}
+	var actor_reasons: Dictionary = {}
 
-	for actor in actor_states:
+	for source_actor in actor_states:
+		var actor = source_actor.clone()
 		actor_ids.append(actor.actor_id)
-		positions[actor.actor_id] = actor.cell
-		occupancy[actor.cell] = actor.actor_id
+		states[actor.actor_id] = actor
+		initial_positions[actor.actor_id] = actor.cell
+		current_positions[actor.actor_id] = actor.cell
+		last_sources[actor.actor_id] = Vector2(actor.cell)
 
-	var result := TurnResolutionType.new(positions)
-	var statuses: Dictionary = {}
-	var reasons: Dictionary = {}
-	var targets: Dictionary = {}
-	var target_claimants: Dictionary = {}
+	var result := TurnResolutionType.new(initial_positions)
 
-	# Phase 1: validate each raw intent without changing the board.
+	# Movement phase: terrain is the only occupancy restriction. Character
+	# overlaps are deliberately preserved for the collision waves below.
 	for actor_id: StringName in actor_ids:
+		var start: Vector2i = initial_positions[actor_id]
 		var intent = intents.get(
 			actor_id,
 			TurnIntentType.new(actor_id, TurnIntentType.ActionType.WAIT, Vector2i.ZERO)
 		)
+		var movement_result := {
+			"valid": true,
+			"moved": false,
+			"reason": &"waited",
+			"start": start,
+			"target": start,
+		}
+
 		if intent.action_type == TurnIntentType.ActionType.WAIT:
-			statuses[actor_id] = STATUS_WAITING
-			reasons[actor_id] = &"waited"
-			targets[actor_id] = positions[actor_id]
-			continue
-
-		if intent.action_type != TurnIntentType.ActionType.MOVE or not intent.delta in VALID_DELTAS:
-			statuses[actor_id] = STATUS_FAILED
-			reasons[actor_id] = &"invalid_direction"
-			targets[actor_id] = positions[actor_id]
-			continue
-
-		var target: Vector2i = positions[actor_id] + intent.delta
-		targets[actor_id] = target
-		if not _is_inside(target, board_size):
-			statuses[actor_id] = STATUS_FAILED
-			reasons[actor_id] = &"out_of_bounds"
-			continue
-		if blocked.has(target):
-			statuses[actor_id] = STATUS_FAILED
-			reasons[actor_id] = &"blocked_by_terrain"
-			continue
-
-		statuses[actor_id] = STATUS_PENDING
-		var claimants: Array = target_claimants.get(target, [])
-		claimants.append(actor_id)
-		target_claimants[target] = claimants
-
-	# Phase 2: nobody wins a contested destination.
-	for target: Vector2i in target_claimants:
-		var claimants: Array = target_claimants[target]
-		if claimants.size() <= 1:
-			continue
-		for actor_id: StringName in claimants:
-			statuses[actor_id] = STATUS_FAILED
-			reasons[actor_id] = &"target_conflict"
-
-	# Phase 3: build dependencies on actors that must vacate their start cells.
-	var dependencies: Dictionary = {}
-	for actor_id: StringName in actor_ids:
-		if statuses[actor_id] != STATUS_PENDING:
-			continue
-		var target: Vector2i = targets[actor_id]
-		if not occupancy.has(target):
-			dependencies[actor_id] = StringName()
-			continue
-
-		var occupant_id: StringName = occupancy[target]
-		if statuses[occupant_id] == STATUS_PENDING:
-			dependencies[actor_id] = occupant_id
+			actor_reasons[actor_id] = &"waited"
+		elif intent.action_type != TurnIntentType.ActionType.MOVE or not intent.delta in VALID_DELTAS:
+			movement_result["valid"] = false
+			movement_result["reason"] = &"invalid_direction"
+			actor_reasons[actor_id] = &"invalid_direction"
 		else:
-			statuses[actor_id] = STATUS_FAILED
-			reasons[actor_id] = &"occupied_actor_not_leaving"
+			var target: Vector2i = start + intent.delta
+			movement_result["target"] = target
+			if not _is_inside(target, board_size):
+				movement_result["valid"] = false
+				movement_result["reason"] = &"out_of_bounds"
+				actor_reasons[actor_id] = &"out_of_bounds"
+			elif blocked.has(target):
+				movement_result["valid"] = false
+				movement_result["reason"] = &"blocked_by_terrain"
+				actor_reasons[actor_id] = &"blocked_by_terrain"
+			else:
+				movement_result["moved"] = true
+				movement_result["reason"] = &"moved"
+				actor_reasons[actor_id] = &"moved"
+				valid_movers[actor_id] = true
+				current_positions[actor_id] = target
+				last_sources[actor_id] = Vector2(start)
 
-	# Phase 4: resolve chains and cycles, then commit every success together.
+		result.movement_results[actor_id] = movement_result
+		result.movement_positions[actor_id] = current_positions[actor_id]
+		result.tentative_positions[actor_id] = current_positions[actor_id]
+
+	var next_wave_index := 0
+	var dead_actor_ids: Array = []
+
+	# Special wave zero: reciprocal initial moves collide on the crossed edge.
+	var edge_specs := _build_head_on_specs(
+		actor_ids, initial_positions, current_positions, valid_movers
+	)
+	if not edge_specs.is_empty():
+		var edge_wave := _resolve_collision_wave(
+			&"edge",
+			edge_specs,
+			next_wave_index,
+			states,
+			initial_positions,
+			current_positions,
+			last_sources,
+			actor_reasons,
+			dead_actor_ids,
+			result
+		)
+		result.collision_waves.append(edge_wave)
+		next_wave_index += 1
+
+	# Grid collision waves: every wave snapshots all overloaded cells, resolves
+	# their disjoint groups, then applies every death and return simultaneously.
+	var seen_states: Dictionary = {}
+	var max_grid_waves := maxi(4, actor_ids.size() * actor_ids.size() + 1)
+	var grid_wave_count := 0
+	while true:
+		var grid_specs := _build_grid_specs(current_positions)
+		if grid_specs.is_empty():
+			break
+
+		var signature := _state_signature(current_positions, states, last_sources)
+		if seen_states.has(signature) or grid_wave_count >= max_grid_waves:
+			result.collision_cycle_detected = true
+			for actor_id: StringName in current_positions.keys():
+				current_positions[actor_id] = initial_positions[actor_id]
+				last_sources[actor_id] = Vector2(initial_positions[actor_id])
+				actor_reasons[actor_id] = &"collision_cycle_reset"
+			result.collision_waves.append({
+				"wave_index": next_wave_index,
+				"kind": &"cycle_reset",
+				"groups": [],
+				"positions_after": current_positions.duplicate(true),
+				"dead_actor_ids": [],
+			})
+			break
+		seen_states[signature] = true
+
+		var grid_wave := _resolve_collision_wave(
+			&"grid",
+			grid_specs,
+			next_wave_index,
+			states,
+			initial_positions,
+			current_positions,
+			last_sources,
+			actor_reasons,
+			dead_actor_ids,
+			result
+		)
+		result.collision_waves.append(grid_wave)
+		next_wave_index += 1
+		grid_wave_count += 1
+
+	# Commit final living states and summarize each actor's complete turn.
+	result.final_positions.clear()
 	for actor_id: StringName in actor_ids:
-		if statuses[actor_id] == STATUS_PENDING:
-			_resolve_pending_chain(actor_id, statuses, reasons, dependencies)
+		if actor_id in dead_actor_ids:
+			var dead_target: Vector2i = result.movement_positions[actor_id]
+			result.set_outcome(actor_id, false, false, &"died_in_combat", dead_target)
+			continue
 
-	for actor_id: StringName in actor_ids:
-		var status: StringName = statuses[actor_id]
-		var target: Vector2i = targets[actor_id]
-		if status == STATUS_SUCCESS:
-			result.final_positions[actor_id] = target
-			result.set_outcome(actor_id, true, true, &"moved", target)
-		elif status == STATUS_WAITING:
-			result.set_outcome(actor_id, true, false, &"waited", target)
-		else:
-			result.set_outcome(actor_id, false, false, reasons[actor_id], target)
+		var actor = states[actor_id]
+		actor.cell = current_positions[actor_id]
+		result.final_actor_states[actor_id] = actor
+		result.final_positions[actor_id] = actor.cell
 
+		var reason: StringName = actor_reasons.get(actor_id, &"waited")
+		var moved: bool = actor.cell != initial_positions[actor_id]
+		var success: bool = reason in [
+			&"moved", &"waited", &"combat_winner_moved", &"combat_winner_held"
+		]
+		result.set_outcome(actor_id, success, moved, reason, actor.cell)
+
+	result.dead_actor_ids = dead_actor_ids.duplicate()
 	return result
 
 
-static func _resolve_pending_chain(
-	start_actor_id: StringName,
-	statuses: Dictionary,
-	reasons: Dictionary,
-	dependencies: Dictionary
-) -> void:
-	var path: Array = []
-	var path_indices: Dictionary = {}
-	var current_actor_id: StringName = start_actor_id
+static func _resolve_collision_wave(
+	kind: StringName,
+	group_specs: Array,
+	wave_index: int,
+	states: Dictionary,
+	initial_positions: Dictionary,
+	current_positions: Dictionary,
+	last_sources: Dictionary,
+	actor_reasons: Dictionary,
+	dead_actor_ids: Array,
+	result
+) -> Dictionary:
+	var wave := {
+		"wave_index": wave_index,
+		"kind": kind,
+		"groups": [],
+		"positions_before": current_positions.duplicate(true),
+		"health_before": _health_snapshot(current_positions, states),
+		"dead_actor_ids": [],
+	}
+	var position_updates: Dictionary = {}
+	var source_updates: Dictionary = {}
+	var wave_dead: Array = []
 
-	while true:
-		var status: StringName = statuses[current_actor_id]
-		if status == STATUS_SUCCESS:
-			_mark_path_success(path, statuses)
-			return
-		if status != STATUS_PENDING:
-			_mark_path_failed(path, statuses, reasons)
-			return
-		if path_indices.has(current_actor_id):
-			# Reaching an actor already in this path means the dependency graph
-			# contains a swap or a larger closed movement cycle.
-			_mark_path_success(path, statuses)
-			return
+	for group_index in group_specs.size():
+		var spec: Dictionary = group_specs[group_index]
+		var participants: Array = spec["participants"]
+		var center: Vector2 = spec["center"]
+		var ordered := _sort_participants(participants, center, last_sources)
+		var hostile_pairs := _hostile_pairs(ordered, states)
+		var group_events: Array = []
 
-		path_indices[current_actor_id] = path.size()
-		path.append(current_actor_id)
-		var dependency: StringName = dependencies.get(current_actor_id, StringName())
-		if dependency == StringName():
-			_mark_path_success(path, statuses)
-			return
-		current_actor_id = dependency
+		for pair: Array in hostile_pairs:
+			var first_id: StringName = pair[0]
+			var second_id: StringName = pair[1]
+			var first = states[first_id]
+			var second = states[second_id]
+			var event := {
+				"wave_index": wave_index,
+				"group_index": group_index,
+				"kind": kind,
+				"center": center,
+				"first_id": first_id,
+				"second_id": second_id,
+				"damage_to_first": second.attack,
+				"damage_to_second": first.attack,
+				"first_health_before": first.health,
+				"second_health_before": second.health,
+			}
+			first.health -= second.attack
+			second.health -= first.attack
+			event["first_health_after"] = first.health
+			event["second_health_after"] = second.health
+			group_events.append(event)
+			result.combat_events.append(event)
+
+		var survivors: Array = []
+		var group_dead: Array = []
+		for actor_id: StringName in ordered:
+			if states[actor_id].is_alive():
+				survivors.append(actor_id)
+			else:
+				group_dead.append(actor_id)
+				wave_dead.append(actor_id)
+				if not actor_id in dead_actor_ids:
+					dead_actor_ids.append(actor_id)
+				actor_reasons[actor_id] = &"died_in_combat"
+
+		var returned: Array = []
+		if survivors.size() > 1:
+			for actor_id: StringName in survivors:
+				returned.append(actor_id)
+				position_updates[actor_id] = initial_positions[actor_id]
+				source_updates[actor_id] = center
+				actor_reasons[actor_id] = (
+					&"combat_survivor_returned"
+					if not hostile_pairs.is_empty()
+					else &"friendly_collision"
+				)
+		elif survivors.size() == 1:
+			var winner_id: StringName = survivors[0]
+			actor_reasons[winner_id] = (
+				&"combat_winner_held"
+				if current_positions[winner_id] == initial_positions[winner_id]
+				else &"combat_winner_moved"
+			)
+
+		var source_snapshot: Dictionary = {}
+		for actor_id: StringName in ordered:
+			source_snapshot[actor_id] = last_sources[actor_id]
+		var group_result := {
+			"wave_index": wave_index,
+			"group_index": group_index,
+			"kind": kind,
+			"center": center,
+			"cell": spec.get("cell", Vector2i(-1, -1)),
+			"participants": ordered,
+			"source_positions": source_snapshot,
+			"combat_events": group_events,
+			"survivors": survivors,
+			"returned_actor_ids": returned,
+			"dead_actor_ids": group_dead,
+			"had_combat": not hostile_pairs.is_empty(),
+		}
+		wave["groups"].append(group_result)
+		result.collision_groups.append(group_result)
+
+	# All groups in this wave are disjoint. Commit their deaths and returns only
+	# after every group has finished calculating its result.
+	for actor_id: StringName in wave_dead:
+		current_positions.erase(actor_id)
+		last_sources.erase(actor_id)
+	for actor_id: StringName in position_updates:
+		if actor_id in wave_dead:
+			continue
+		current_positions[actor_id] = position_updates[actor_id]
+		last_sources[actor_id] = source_updates[actor_id]
+
+	wave["dead_actor_ids"] = wave_dead
+	wave["positions_after"] = current_positions.duplicate(true)
+	wave["health_after"] = _health_snapshot(current_positions, states)
+	return wave
 
 
-static func _mark_path_success(path: Array, statuses: Dictionary) -> void:
-	for actor_id: StringName in path:
-		statuses[actor_id] = STATUS_SUCCESS
+static func _build_head_on_specs(
+	actor_ids: Array,
+	initial_positions: Dictionary,
+	movement_positions: Dictionary,
+	valid_movers: Dictionary
+) -> Array:
+	var specs: Array = []
+	var paired: Dictionary = {}
+	for first_index in actor_ids.size():
+		var first_id: StringName = actor_ids[first_index]
+		if paired.has(first_id) or not valid_movers.has(first_id):
+			continue
+		for second_index in range(first_index + 1, actor_ids.size()):
+			var second_id: StringName = actor_ids[second_index]
+			if paired.has(second_id) or not valid_movers.has(second_id):
+				continue
+			if (
+				movement_positions[first_id] == initial_positions[second_id]
+				and movement_positions[second_id] == initial_positions[first_id]
+			):
+				paired[first_id] = true
+				paired[second_id] = true
+				specs.append({
+					"participants": [first_id, second_id],
+					"center": (
+						Vector2(initial_positions[first_id])
+						+ Vector2(initial_positions[second_id])
+					) * 0.5,
+				})
+				break
+	return specs
 
 
-static func _mark_path_failed(path: Array, statuses: Dictionary, reasons: Dictionary) -> void:
-	for actor_id: StringName in path:
-		statuses[actor_id] = STATUS_FAILED
-		reasons[actor_id] = &"occupied_actor_not_leaving"
+static func _build_grid_specs(current_positions: Dictionary) -> Array:
+	var occupancy: Dictionary = {}
+	for actor_id: StringName in current_positions:
+		var cell: Vector2i = current_positions[actor_id]
+		var participants: Array = occupancy.get(cell, [])
+		participants.append(actor_id)
+		occupancy[cell] = participants
+
+	var crowded_cells: Array = []
+	for cell: Vector2i in occupancy:
+		if occupancy[cell].size() > 1:
+			crowded_cells.append(cell)
+	crowded_cells.sort_custom(func(first: Vector2i, second: Vector2i):
+		return first.y < second.y or (first.y == second.y and first.x < second.x)
+	)
+
+	var specs: Array = []
+	for cell: Vector2i in crowded_cells:
+		specs.append({
+			"participants": occupancy[cell].duplicate(),
+			"center": Vector2(cell),
+			"cell": cell,
+		})
+	return specs
+
+
+static func _hostile_pairs(ordered: Array, states: Dictionary) -> Array:
+	var pairs: Array = []
+	for first_index in ordered.size():
+		for second_index in range(first_index + 1, ordered.size()):
+			var first_id: StringName = ordered[first_index]
+			var second_id: StringName = ordered[second_index]
+			if states[first_id].faction != states[second_id].faction:
+				pairs.append([first_id, second_id])
+	return pairs
+
+
+static func _sort_participants(
+	participants: Array,
+	center: Vector2,
+	source_positions: Dictionary
+) -> Array:
+	var ordered: Array = []
+	for actor_id: StringName in participants:
+		var insert_at := ordered.size()
+		for index in ordered.size():
+			if _participant_before(actor_id, ordered[index], center, source_positions):
+				insert_at = index
+				break
+		ordered.insert(insert_at, actor_id)
+	return ordered
+
+
+static func _participant_before(
+	first_id: StringName,
+	second_id: StringName,
+	center: Vector2,
+	source_positions: Dictionary
+) -> bool:
+	var first_priority := _source_priority(source_positions[first_id] - center)
+	var second_priority := _source_priority(source_positions[second_id] - center)
+	if first_priority != second_priority:
+		return first_priority < second_priority
+	return String(first_id) < String(second_id)
+
+
+static func _source_priority(offset: Vector2) -> int:
+	if offset.is_zero_approx():
+		return 4
+	if absf(offset.y) >= absf(offset.x):
+		return 0 if offset.y < 0.0 else 2
+	return 1 if offset.x > 0.0 else 3
+
+
+static func _health_snapshot(current_positions: Dictionary, states: Dictionary) -> Dictionary:
+	var snapshot: Dictionary = {}
+	for actor_id: StringName in current_positions:
+		snapshot[actor_id] = states[actor_id].health
+	return snapshot
+
+
+static func _state_signature(
+	current_positions: Dictionary,
+	states: Dictionary,
+	last_sources: Dictionary
+) -> String:
+	var ids := current_positions.keys()
+	ids.sort()
+	var parts: Array = []
+	for actor_id: StringName in ids:
+		parts.append("%s:%s:%d:%s" % [
+			actor_id,
+			current_positions[actor_id],
+			states[actor_id].health,
+			last_sources[actor_id],
+		])
+	return "|".join(parts)
 
 
 static func _is_inside(cell: Vector2i, board_size: Vector2i) -> bool:
