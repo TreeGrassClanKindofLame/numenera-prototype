@@ -2,74 +2,462 @@ extends Control
 
 const SquadUnitStateType = preload("res://scripts/model/squad_unit_state.gd")
 
+const STAGE_RECT := Rect2(32.0, 28.0, 1136.0, 664.0)
+const FIELD_RECT := Rect2(62.0, 102.0, 802.0, 520.0)
+const QUEUE_RECT := Rect2(888.0, 102.0, 250.0, 520.0)
+const CARD_SIZE := Vector2(156.0, 98.0)
+const COLUMN_GAP := 30.0
+const ROW_GAP := 12.0
+const PLAYER_ROW_Y := [444.0, 554.0]
+const ENEMY_ROW_Y := [304.0, 194.0]
+
 var snapshot: Dictionary = {}
+var encounter: Dictionary = {}
+var context: Dictionary = {}
+var schedule: Array = []
+var current_schedule_index := -1
 var attacker_squad_id: StringName = &""
 var attacker_unit_id: StringName = &""
 var defender_squad_id: StringName = &""
 var defender_unit_id: StringName = &""
-var caption := ""
+var bottom_squad_id: StringName = &""
+var top_squad_id: StringName = &""
+var headline := ""
+var detail_text := ""
+var result_text := ""
+var mode: StringName = &"hidden"
+var slow_motion := false
+var attack_progress := 0.0
+var damage_progress := 0.0
+var impact_flash := 0.0
+var target_died := false
+var active_event: Dictionary = {}
+var _audio_players: Dictionary = {}
 
 
 func setup() -> void:
-	mouse_filter = Control.MOUSE_FILTER_IGNORE
+	mouse_filter = Control.MOUSE_FILTER_STOP
 	set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	_build_audio_players()
 	hide()
 
 
-func show_event(event: Dictionary, after_damage: bool = false) -> void:
-	snapshot = event["formations_after"] if after_damage else event["formations_before"]
-	attacker_squad_id = event["attacker_squad_id"]
-	attacker_unit_id = event["attacker_unit_id"]
-	defender_squad_id = event["defender_squad_id"]
-	defender_unit_id = event["defender_unit_id"]
-	caption = "%s/%s  攻击  %s/%s　伤害 %d" % [
-		attacker_squad_id, attacker_unit_id,
-		defender_squad_id, defender_unit_id,
-		event["damage"],
-	]
+func begin_encounter(p_encounter: Dictionary, p_context: Dictionary, p_slow_motion: bool) -> void:
+	encounter = p_encounter
+	context = p_context
+	slow_motion = p_slow_motion
+	snapshot = encounter.get("formations_before", {}).duplicate(true)
+	schedule = encounter.get("turn_schedule", []).duplicate(true)
+	current_schedule_index = -1
+	active_event.clear()
+	_reset_action_visuals()
+	_assign_sides()
+	headline = _context_title()
+	detail_text = "准备自动战斗"
+	result_text = ""
+	mode = &"battle"
 	show()
 	queue_redraw()
 
 
-func clear_event() -> void:
-	hide()
-	snapshot.clear()
+func preview_action(schedule_entry: Dictionary, event: Dictionary) -> void:
+	current_schedule_index = schedule_entry.get("schedule_index", -1)
+	active_event = event
+	snapshot = event.get("formations_before", snapshot).duplicate(true)
+	attacker_squad_id = event.get("attacker_squad_id", &"")
+	attacker_unit_id = event.get("attacker_unit_id", &"")
+	defender_squad_id = event.get("defender_squad_id", &"")
+	defender_unit_id = event.get("defender_unit_id", &"")
+	attack_progress = 0.0
+	damage_progress = 0.0
+	impact_flash = 0.0
+	target_died = event.get("target_died", false)
+	detail_text = _target_reason_text(event) if slow_motion else "%s 准备攻击 %s" % [
+		_unit_display_name(attacker_squad_id, attacker_unit_id),
+		_unit_display_name(defender_squad_id, defender_unit_id),
+	]
+	mode = &"battle"
 	queue_redraw()
 
 
-func _draw() -> void:
-	if snapshot.is_empty():
-		return
-	var panel := Rect2(Vector2(86.0, 138.0), Vector2(448.0, 300.0))
-	draw_rect(panel, Color(0.035, 0.055, 0.085, 0.96), true)
-	draw_rect(panel, Color("8ea4c4"), false, 2.0)
-	draw_string(ThemeDB.fallback_font, Vector2(110.0, 174.0), "小队自动战斗", HORIZONTAL_ALIGNMENT_LEFT, -1, 22, Color.WHITE)
-	draw_string(ThemeDB.fallback_font, Vector2(110.0, 204.0), caption, HORIZONTAL_ALIGNMENT_LEFT, 400.0, 14, Color("dbe7f7"))
+func set_attack_progress(value: float) -> void:
+	attack_progress = clampf(value, 0.0, 1.0)
+	queue_redraw()
 
-	var squad_ids := snapshot.keys()
-	squad_ids.sort()
-	for squad_index in squad_ids.size():
-		var squad_id: StringName = squad_ids[squad_index]
-		var origin := Vector2(116.0 + squad_index * 218.0, 248.0)
-		draw_string(ThemeDB.fallback_font, origin + Vector2(0.0, -16.0), String(squad_id), HORIZONTAL_ALIGNMENT_LEFT, 190.0, 16, Color.WHITE)
-		for row in 2:
-			for column in 3:
-				var rect := Rect2(origin + Vector2(column * 62.0, row * 76.0), Vector2(56.0, 66.0))
-				draw_rect(rect, Color("1b2a3e"), true)
-				draw_rect(rect, Color("4d627d"), false, 1.0)
+
+func set_impact_flash(value: float) -> void:
+	impact_flash = clampf(value, 0.0, 1.0)
+	queue_redraw()
+
+
+func set_damage_progress(value: float) -> void:
+	damage_progress = clampf(value, 0.0, 1.0)
+	queue_redraw()
+
+
+func commit_action(event: Dictionary) -> void:
+	snapshot = event.get("formations_after", snapshot).duplicate(true)
+	attack_progress = 0.0
+	damage_progress = 1.0
+	impact_flash = 0.0
+	detail_text = "%s 造成 %d 点伤害%s" % [
+		_unit_display_name(event.get("attacker_squad_id", &""), event.get("attacker_unit_id", &"")),
+		event.get("damage", 0),
+		"，目标阵亡" if event.get("target_died", false) else "",
+	]
+	queue_redraw()
+
+
+func show_skipped_action(schedule_entry: Dictionary) -> void:
+	current_schedule_index = schedule_entry.get("schedule_index", -1)
+	active_event.clear()
+	_reset_action_visuals()
+	detail_text = "%s：%s" % [
+		_unit_display_name(schedule_entry.get("squad_id", &""), schedule_entry.get("unit_id", &"")),
+		_skip_reason_text(schedule_entry.get("skipped_reason", &"")),
+	]
+	queue_redraw()
+
+
+func show_skipped_encounter(p_encounter: Dictionary, p_context: Dictionary) -> void:
+	begin_encounter(p_encounter, p_context, slow_motion)
+	mode = &"skipped"
+	detail_text = "该小队已全灭，本场跳过"
+	queue_redraw()
+
+
+func show_result(p_encounter: Dictionary) -> void:
+	encounter = p_encounter
+	snapshot = encounter.get("formations_after", snapshot).duplicate(true)
+	current_schedule_index = schedule.size()
+	active_event.clear()
+	_reset_action_visuals()
+	mode = &"result"
+	var first_id: StringName = encounter.get("first_squad_id", &"")
+	var second_id: StringName = encounter.get("second_squad_id", &"")
+	var first_before: int = encounter.get("first_alive_before", 0)
+	var second_before: int = encounter.get("second_alive_before", 0)
+	var first_after: int = encounter.get("first_alive_after", 0)
+	var second_after: int = encounter.get("second_alive_after", 0)
+	var verdict := "双方仍有战力"
+	if first_after <= 0 and second_after <= 0:
+		verdict = "双方全灭"
+	elif first_after <= 0:
+		verdict = "%s 胜利" % _squad_display_name(second_id)
+	elif second_after <= 0:
+		verdict = "%s 胜利" % _squad_display_name(first_id)
+	result_text = "%s　｜　%s 阵亡 %d，剩余 %d　｜　%s 阵亡 %d，剩余 %d" % [
+		verdict,
+		_squad_display_name(first_id), first_before - first_after, first_after,
+		_squad_display_name(second_id), second_before - second_after, second_after,
+	]
+	detail_text = "战斗结束"
+	queue_redraw()
+
+
+func end_encounter() -> void:
+	hide()
+	mode = &"hidden"
+	snapshot.clear()
+	encounter.clear()
+	schedule.clear()
+	active_event.clear()
+	queue_redraw()
+
+
+func play_audio_cue(cue: StringName) -> void:
+	if _audio_players.has(cue):
+		_audio_players[cue].play()
+
+
+func _draw() -> void:
+	if mode == &"hidden" or snapshot.is_empty():
+		return
+	draw_rect(Rect2(Vector2.ZERO, size), Color(0.01, 0.015, 0.025, 0.82), true)
+	draw_rect(STAGE_RECT, Color(0.035, 0.055, 0.085, 0.985), true)
+	draw_rect(STAGE_RECT, Color("8ea4c4"), false, 2.0)
+	draw_rect(FIELD_RECT, Color("111d2c"), true)
+	draw_rect(FIELD_RECT, Color("344b68"), false, 2.0)
+	draw_rect(QUEUE_RECT, Color("121b28"), true)
+	draw_rect(QUEUE_RECT, Color("344b68"), false, 2.0)
+	draw_string(ThemeDB.fallback_font, Vector2(58.0, 69.0), headline, HORIZONTAL_ALIGNMENT_LEFT, 780.0, 22, Color.WHITE)
+	draw_string(ThemeDB.fallback_font, Vector2(58.0, 94.0), detail_text, HORIZONTAL_ALIGNMENT_LEFT, 780.0, 14, Color("dbe7f7"))
+	draw_string(ThemeDB.fallback_font, Vector2(910.0, 134.0), "行动队列", HORIZONTAL_ALIGNMENT_LEFT, 200.0, 20, Color.WHITE)
+
+	_draw_formation(top_squad_id, false)
+	_draw_formation(bottom_squad_id, true)
+	_draw_attack_connection()
+	_draw_action_queue()
+	if mode == &"result":
+		_draw_result_banner()
+	elif mode == &"skipped":
+		_draw_skip_banner()
+
+
+func _draw_formation(squad_id: StringName, is_bottom: bool) -> void:
+	if squad_id == &"" or not snapshot.has(squad_id):
+		return
+	var label_y := 466.0 if is_bottom else 142.0
+	draw_string(
+		ThemeDB.fallback_font,
+		Vector2(88.0, label_y),
+		_squad_display_name(squad_id),
+		HORIZONTAL_ALIGNMENT_LEFT,
+		300.0,
+		18,
+		Color("6db4ff") if _controller_for(squad_id) == &"player" else Color("ffad68")
+	)
+	var by_slot: Dictionary = {}
+	for unit: Dictionary in snapshot[squad_id]:
+		by_slot[unit["slot"]] = unit
+	for row in 2:
+		for column in 3:
+			var slot := Vector2i(column, row)
+			var rect := _slot_rect(slot, is_bottom)
+			if by_slot.has(slot):
+				_draw_unit_card(squad_id, by_slot[slot], rect)
+			else:
+				draw_rect(rect, Color("172638"), true)
+				draw_rect(rect, Color("30455f"), false, 1.0)
+				draw_string(ThemeDB.fallback_font, rect.position + Vector2(0.0, 54.0), "空", HORIZONTAL_ALIGNMENT_CENTER, rect.size.x, 13, Color("58697d"))
+
+
+func _draw_unit_card(squad_id: StringName, unit: Dictionary, rect: Rect2) -> void:
+	var alive: bool = unit.get("alive", false)
+	var unit_id: StringName = unit.get("unit_id", &"")
+	var is_attacker: bool = squad_id == attacker_squad_id and unit_id == attacker_unit_id
+	var is_defender: bool = squad_id == defender_squad_id and unit_id == defender_unit_id
+	var card_rect := rect
+	if is_attacker and attack_progress > 0.0:
+		var target_center := _unit_center(defender_squad_id, defender_unit_id)
+		var direction := (target_center - rect.get_center()).normalized()
+		card_rect.position += direction * sin(attack_progress * PI) * 18.0
+	if not alive:
+		card_rect = card_rect.grow(-8.0)
+	var color := _class_color(unit.get("unit_class", &""))
+	if not alive:
+		color = Color("3f4650")
+	elif is_defender and impact_flash > 0.0:
+		color = color.lerp(Color("ff4f55"), impact_flash)
+	if is_defender and impact_flash > 0.0:
+		card_rect.position.x += sin(impact_flash * PI * 6.0) * 4.0
+	draw_rect(card_rect, color, true)
+	draw_rect(card_rect, Color("ffdf75") if is_attacker else Color("ff6570") if is_defender else Color("71859e"), false, 4.0 if is_attacker or is_defender else 1.0)
+	draw_string(ThemeDB.fallback_font, card_rect.position + Vector2(8.0, 24.0), _class_short(unit.get("unit_class", &"")), HORIZONTAL_ALIGNMENT_LEFT, card_rect.size.x - 16.0, 17, Color.WHITE)
+	draw_string(ThemeDB.fallback_font, card_rect.position + Vector2(8.0, 45.0), "攻%d　速%d" % [unit.get("attack", 0), unit.get("speed", 0)], HORIZONTAL_ALIGNMENT_LEFT, card_rect.size.x - 16.0, 12, Color("e1e9f3"))
+	var health_value: float = unit.get("health", 0)
+	if is_defender and not active_event.is_empty() and damage_progress < 1.0:
+		health_value = lerpf(active_event.get("health_before", health_value), active_event.get("health_after", health_value), damage_progress)
+	var max_health: float = maxf(unit.get("max_health", 1), 1.0)
+	var health_ratio := clampf(health_value / max_health, 0.0, 1.0)
+	var bar_rect := Rect2(card_rect.position + Vector2(8.0, 58.0), Vector2(card_rect.size.x - 16.0, 12.0))
+	draw_rect(bar_rect, Color("281d25"), true)
+	draw_rect(Rect2(bar_rect.position, Vector2(bar_rect.size.x * health_ratio, bar_rect.size.y)), Color("55c97a") if health_ratio > 0.35 else Color("e05b5b"), true)
+	draw_string(ThemeDB.fallback_font, card_rect.position + Vector2(8.0, 88.0), "HP %d/%d" % [maxi(roundi(health_value), 0), roundi(max_health)], HORIZONTAL_ALIGNMENT_LEFT, card_rect.size.x - 16.0, 12, Color.WHITE)
+	if not alive:
+		draw_rect(card_rect, Color(0.05, 0.05, 0.06, 0.48), true)
+		draw_string(ThemeDB.fallback_font, card_rect.position + Vector2(0.0, 57.0), "阵亡", HORIZONTAL_ALIGNMENT_CENTER, card_rect.size.x, 18, Color("ff8a8a"))
+	if is_defender and not active_event.is_empty() and damage_progress > 0.0:
+		var float_y := lerpf(card_rect.position.y + 12.0, card_rect.position.y - 18.0, damage_progress)
+		draw_string(ThemeDB.fallback_font, Vector2(card_rect.end.x - 52.0, float_y), "-%d" % active_event.get("damage", 0), HORIZONTAL_ALIGNMENT_CENTER, 52.0, 20, Color("ffdc65"))
+
+
+func _draw_attack_connection() -> void:
+	if active_event.is_empty() or attacker_unit_id == &"" or defender_unit_id == &"":
+		return
+	var from := _unit_center(attacker_squad_id, attacker_unit_id)
+	var to := _unit_center(defender_squad_id, defender_unit_id)
+	if from == Vector2.ZERO or to == Vector2.ZERO:
+		return
+	var alpha := 0.35 + 0.65 * maxf(attack_progress, 0.25)
+	draw_dashed_line(from, to, Color(1.0, 0.82, 0.32, alpha), 3.0, 9.0)
+	var direction := (to - from).normalized()
+	var side := direction.rotated(PI * 0.5)
+	draw_colored_polygon(PackedVector2Array([to, to - direction * 16.0 + side * 7.0, to - direction * 16.0 - side * 7.0]), Color(1.0, 0.82, 0.32, alpha))
+
+
+func _draw_action_queue() -> void:
+	var y := 164.0
+	for index in schedule.size():
+		var entry: Dictionary = schedule[index]
+		var rect := Rect2(904.0, y, 218.0, 40.0)
+		var state := &"pending"
+		if index < current_schedule_index:
+			state = entry.get("status", &"acted")
+		elif index == current_schedule_index:
+			state = &"current"
+		var background := Color("1b2b3d")
+		var text_color := Color("dce7f4")
+		if state == &"current":
+			background = Color("5c4d25")
+			text_color = Color("ffe78d")
+		elif state == &"acted":
+			background = Color("17212e")
+			text_color = Color("718196")
+		elif state == &"skipped":
+			background = Color("281d25")
+			text_color = Color("cf7880")
+		draw_rect(rect, background, true)
+		draw_rect(rect, Color("3b516b"), false, 1.0)
+		var prefix := "▶" if state == &"current" else "×" if state == &"skipped" else "✓" if state == &"acted" else "%d" % (index + 1)
+		var label := "%s  %s　速%d" % [prefix, _unit_display_name(entry.get("squad_id", &""), entry.get("unit_id", &"")), entry.get("speed", 0)]
+		draw_string(ThemeDB.fallback_font, rect.position + Vector2(8.0, 17.0), label, HORIZONTAL_ALIGNMENT_LEFT, 202.0, 12, text_color)
+		if state == &"skipped":
+			draw_string(ThemeDB.fallback_font, rect.position + Vector2(8.0, 34.0), _skip_reason_text(entry.get("skipped_reason", &"")), HORIZONTAL_ALIGNMENT_LEFT, 202.0, 10, text_color)
+		y += 46.0
+
+
+func _draw_result_banner() -> void:
+	var rect := Rect2(104.0, 340.0, 718.0, 86.0)
+	draw_rect(rect, Color(0.06, 0.09, 0.13, 0.97), true)
+	draw_rect(rect, Color("f1ca64"), false, 3.0)
+	draw_string(ThemeDB.fallback_font, rect.position + Vector2(0.0, 30.0), "战果", HORIZONTAL_ALIGNMENT_CENTER, rect.size.x, 24, Color("ffe38a"))
+	draw_string(ThemeDB.fallback_font, rect.position + Vector2(18.0, 62.0), result_text, HORIZONTAL_ALIGNMENT_CENTER, rect.size.x - 36.0, 14, Color.WHITE)
+
+
+func _draw_skip_banner() -> void:
+	var rect := Rect2(176.0, 344.0, 574.0, 70.0)
+	draw_rect(rect, Color(0.12, 0.08, 0.09, 0.97), true)
+	draw_rect(rect, Color("bf6570"), false, 2.0)
+	draw_string(ThemeDB.fallback_font, rect.position + Vector2(0.0, 43.0), detail_text, HORIZONTAL_ALIGNMENT_CENTER, rect.size.x, 20, Color("ffb4b9"))
+
+
+func _assign_sides() -> void:
+	var first_id: StringName = encounter.get("first_squad_id", &"")
+	var second_id: StringName = encounter.get("second_squad_id", &"")
+	var first_controller: StringName = encounter.get("first_controller", &"npc")
+	var second_controller: StringName = encounter.get("second_controller", &"npc")
+	if first_controller == &"player":
+		bottom_squad_id = first_id
+		top_squad_id = second_id
+	elif second_controller == &"player":
+		bottom_squad_id = second_id
+		top_squad_id = first_id
+	else:
+		bottom_squad_id = first_id
+		top_squad_id = second_id
+
+
+func _slot_rect(slot: Vector2i, is_bottom: bool) -> Rect2:
+	var total_width := CARD_SIZE.x * 3.0 + COLUMN_GAP * 2.0
+	var start_x := FIELD_RECT.position.x + (FIELD_RECT.size.x - total_width) * 0.5
+	var row_y: float = PLAYER_ROW_Y[slot.y] if is_bottom else ENEMY_ROW_Y[slot.y]
+	return Rect2(Vector2(start_x + slot.x * (CARD_SIZE.x + COLUMN_GAP), row_y), CARD_SIZE)
+
+
+func _unit_center(squad_id: StringName, unit_id: StringName) -> Vector2:
+	if squad_id == &"" or not snapshot.has(squad_id):
+		return Vector2.ZERO
+	for unit: Dictionary in snapshot[squad_id]:
+		if unit.get("unit_id", &"") == unit_id:
+			return _slot_rect(unit["slot"], squad_id == bottom_squad_id).get_center()
+	return Vector2.ZERO
+
+
+func _context_title() -> String:
+	return "第%d波　｜　同步冲突点 %d/%d　｜　乱战配对 %d/%d　｜　表现依次回放，逻辑同时结算" % [
+		context.get("wave_index", 0) + 1,
+		context.get("group_index", 0) + 1,
+		maxi(context.get("group_count", 1), 1),
+		context.get("pair_index", 0) + 1,
+		maxi(context.get("pair_count", 1), 1),
+	]
+
+
+func _target_reason_text(event: Dictionary) -> String:
+	var preferred := "前排" if event.get("preferred_row", 0) == 0 else "后排"
+	var selected := "前排" if event.get("selected_row", 0) == 0 else "后排"
+	var parts := ["%s优先" % preferred]
+	if event.get("used_fallback_row", false):
+		parts.append("%s为空" % preferred)
+		parts.append("转向%s" % selected)
+	parts.append("正对列" if event.get("target_distance", 0) == 0 else "最近列")
+	if event.get("used_random_tie", false):
+		var candidates: Array = event.get("candidate_unit_ids", [])
+		var candidate_names: Array = []
+		for candidate_id: StringName in candidates:
+			candidate_names.append(String(candidate_id))
+		parts.append("等距随机：%s" % "/".join(candidate_names))
+		parts.append("本次选择%s" % String(event.get("defender_unit_id", &"")))
+	return " → ".join(parts)
+
+
+func _controller_for(squad_id: StringName) -> StringName:
+	if squad_id == encounter.get("first_squad_id", &""):
+		return encounter.get("first_controller", &"npc")
+	if squad_id == encounter.get("second_squad_id", &""):
+		return encounter.get("second_controller", &"npc")
+	return &"npc"
+
+
+func _unit_display_name(squad_id: StringName, unit_id: StringName) -> String:
+	var class_text := "单位"
+	if snapshot.has(squad_id):
 		for unit: Dictionary in snapshot[squad_id]:
-			var slot: Vector2i = unit["slot"]
-			var rect := Rect2(origin + Vector2(slot.x * 62.0, slot.y * 76.0), Vector2(56.0, 66.0))
-			var color := _class_color(unit["unit_class"])
-			if not unit["alive"]:
-				color = Color("4b5059")
-			draw_rect(rect.grow(-3.0), color, true)
-			if squad_id == attacker_squad_id and unit["unit_id"] == attacker_unit_id:
-				draw_rect(rect.grow(-1.0), Color("ffdb66"), false, 4.0)
-			elif squad_id == defender_squad_id and unit["unit_id"] == defender_unit_id:
-				draw_rect(rect.grow(-1.0), Color("ff5d68"), false, 4.0)
-			draw_string(ThemeDB.fallback_font, rect.position + Vector2(3.0, 22.0), _class_short(unit["unit_class"]), HORIZONTAL_ALIGNMENT_CENTER, 50.0, 13, Color.WHITE)
-			draw_string(ThemeDB.fallback_font, rect.position + Vector2(3.0, 45.0), "HP%d" % maxi(unit["health"], 0), HORIZONTAL_ALIGNMENT_CENTER, 50.0, 12, Color.WHITE)
+			if unit.get("unit_id", &"") == unit_id:
+				class_text = _class_short(unit.get("unit_class", &""))
+				break
+	return "%s/%s" % [_squad_display_name(squad_id), class_text]
+
+
+func _squad_display_name(squad_id: StringName) -> String:
+	match squad_id:
+		&"player": return "主角小队"
+		&"drunk": return "酒鬼小队"
+	return String(squad_id)
+
+
+func _skip_reason_text(reason: StringName) -> String:
+	match reason:
+		&"actor_dead": return "阵亡，跳过行动"
+		&"no_living_enemy": return "敌方已全灭，跳过行动"
+		&"no_valid_target": return "没有有效目标，跳过行动"
+	return "跳过行动"
+
+
+func _reset_action_visuals() -> void:
+	attacker_squad_id = &""
+	attacker_unit_id = &""
+	defender_squad_id = &""
+	defender_unit_id = &""
+	attack_progress = 0.0
+	damage_progress = 0.0
+	impact_flash = 0.0
+	target_died = false
+
+
+func _build_audio_players() -> void:
+	var cue_specs := {
+		&"attack": [520.0, 0.045, 0.20],
+		&"hit": [145.0, 0.055, 0.28],
+		&"death": [92.0, 0.13, 0.30],
+		&"result": [660.0, 0.16, 0.20],
+	}
+	for cue: StringName in cue_specs:
+		var spec: Array = cue_specs[cue]
+		var player := AudioStreamPlayer.new()
+		player.stream = _make_tone(spec[0], spec[1], spec[2])
+		player.volume_db = -14.0
+		_audio_players[cue] = player
+		add_child(player)
+
+
+func _make_tone(frequency: float, duration: float, amplitude: float) -> AudioStreamWAV:
+	var mix_rate := 22050
+	var sample_count := maxi(roundi(duration * mix_rate), 1)
+	var data := PackedByteArray()
+	data.resize(sample_count * 2)
+	for index in sample_count:
+		var t := float(index) / float(mix_rate)
+		var envelope := 1.0 - float(index) / float(sample_count)
+		var sample := roundi(sin(TAU * frequency * t) * envelope * amplitude * 32767.0)
+		data.encode_s16(index * 2, sample)
+	var stream := AudioStreamWAV.new()
+	stream.format = AudioStreamWAV.FORMAT_16_BITS
+	stream.mix_rate = mix_rate
+	stream.stereo = false
+	stream.data = data
+	return stream
 
 
 func _class_short(unit_class: StringName) -> String:

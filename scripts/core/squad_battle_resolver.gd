@@ -5,29 +5,51 @@ static func resolve_round(first_squad, second_squad, rng: RandomNumberGenerator)
 	var result := {
 		"first_squad_id": first_squad.actor_id,
 		"second_squad_id": second_squad.actor_id,
+		"first_controller": first_squad.controller,
+		"second_controller": second_squad.controller,
 		"events": [],
 		"action_order": [],
+		"turn_schedule": [],
 		"first_alive_before": first_squad.living_unit_count(),
 		"second_alive_before": second_squad.living_unit_count(),
-		"formations_before": _formation_snapshot(first_squad, second_squad),
+		"formations_before": formation_snapshot(first_squad, second_squad),
 	}
 	var turns := _build_turn_order(first_squad, second_squad)
-	for turn: Dictionary in turns:
+	for schedule_index in turns.size():
+		var turn: Dictionary = turns[schedule_index]
 		var acting_squad = first_squad if turn["squad_id"] == first_squad.actor_id else second_squad
 		var defending_squad = second_squad if acting_squad == first_squad else first_squad
 		var attacker = acting_squad.unit_by_id(turn["unit_id"])
-		if attacker == null or not attacker.is_alive() or not defending_squad.is_alive():
+		var schedule_entry := turn.duplicate(true)
+		schedule_entry["schedule_index"] = schedule_index
+		schedule_entry["status"] = &"pending"
+		schedule_entry["skipped_reason"] = &""
+		schedule_entry["event_index"] = -1
+		if attacker == null or not attacker.is_alive():
+			schedule_entry["status"] = &"skipped"
+			schedule_entry["skipped_reason"] = &"actor_dead"
+			result["turn_schedule"].append(schedule_entry)
+			continue
+		if not defending_squad.is_alive():
+			schedule_entry["status"] = &"skipped"
+			schedule_entry["skipped_reason"] = &"no_living_enemy"
+			result["turn_schedule"].append(schedule_entry)
 			continue
 		var target_info := _choose_target(attacker, defending_squad, rng)
 		var target = target_info["target"]
 		if target == null:
+			schedule_entry["status"] = &"skipped"
+			schedule_entry["skipped_reason"] = &"no_valid_target"
+			result["turn_schedule"].append(schedule_entry)
 			continue
 		var health_before: int = target.health
 		var squad_health_before: int = defending_squad.health
-		var formations_before := _formation_snapshot(first_squad, second_squad)
+		var formations_before := formation_snapshot(first_squad, second_squad)
 		target.health -= attacker.attack
 		defending_squad.sync_summary_stats()
+		var event_index: int = result["events"].size()
 		var event := {
+			"schedule_index": schedule_index,
 			"attacker_squad_id": acting_squad.actor_id,
 			"defender_squad_id": defending_squad.actor_id,
 			"attacker_unit_id": attacker.unit_id,
@@ -48,11 +70,16 @@ static func resolve_round(first_squad, second_squad, rng: RandomNumberGenerator)
 			"used_fallback_row": target_info["used_fallback_row"],
 			"used_random_tie": target_info["used_random_tie"],
 			"candidate_unit_ids": target_info["candidate_unit_ids"],
+			"target_rule": target_info["target_rule"],
+			"target_distance": target_info["target_distance"],
 			"formations_before": formations_before,
-			"formations_after": _formation_snapshot(first_squad, second_squad),
+			"formations_after": formation_snapshot(first_squad, second_squad),
 		}
 		result["events"].append(event)
 		result["action_order"].append([acting_squad.actor_id, attacker.unit_id])
+		schedule_entry["status"] = &"acted"
+		schedule_entry["event_index"] = event_index
+		result["turn_schedule"].append(schedule_entry)
 
 	first_squad.sync_summary_stats()
 	second_squad.sync_summary_stats()
@@ -60,11 +87,11 @@ static func resolve_round(first_squad, second_squad, rng: RandomNumberGenerator)
 	result["second_alive_after"] = second_squad.living_unit_count()
 	result["first_eliminated"] = not first_squad.is_alive()
 	result["second_eliminated"] = not second_squad.is_alive()
-	result["formations_after"] = _formation_snapshot(first_squad, second_squad)
+	result["formations_after"] = formation_snapshot(first_squad, second_squad)
 	return result
 
 
-static func _formation_snapshot(first_squad, second_squad) -> Dictionary:
+static func formation_snapshot(first_squad, second_squad) -> Dictionary:
 	return {
 		first_squad.actor_id: _unit_snapshot(first_squad),
 		second_squad.actor_id: _unit_snapshot(second_squad),
@@ -124,6 +151,8 @@ static func _choose_target(attacker, defending_squad, rng: RandomNumberGenerator
 			"used_fallback_row": used_fallback_row,
 			"used_random_tie": false,
 			"candidate_unit_ids": [],
+			"target_rule": &"no_valid_target",
+			"target_distance": -1,
 		}
 
 	var nearest_distance := 99
@@ -141,10 +170,15 @@ static func _choose_target(attacker, defending_squad, rng: RandomNumberGenerator
 		candidate_ids.append(candidate.unit_id)
 	var used_random_tie := nearest.size() > 1
 	var target = nearest[0] if nearest.size() == 1 else nearest[rng.randi_range(0, nearest.size() - 1)]
+	var target_distance: int = absi(target.slot.x - attacker.slot.x)
+	var row_rule := "fallback" if used_fallback_row else "preferred"
+	var column_rule := "facing" if target_distance == 0 else "nearest"
 	return {
 		"target": target,
 		"selected_row": selected_row,
 		"used_fallback_row": used_fallback_row,
 		"used_random_tie": used_random_tie,
 		"candidate_unit_ids": candidate_ids,
+		"target_rule": StringName("%s_%s" % [row_rule, column_rule]),
+		"target_distance": target_distance,
 	}

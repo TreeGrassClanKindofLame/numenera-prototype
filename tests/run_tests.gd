@@ -24,6 +24,8 @@ func _run_all() -> void:
 	_test_seeded_equidistant_target_is_reproducible()
 	_test_speed_player_squad_and_unit_tiebreakers()
 	_test_instant_death_prevents_action()
+	_test_turn_schedule_records_actions_and_skips()
+	_test_target_rule_metadata()
 	_test_later_unit_retargets_current_battlefield()
 	_test_single_attack_has_no_counterattack()
 	_test_map_move_wait_wall_and_chain()
@@ -35,10 +37,11 @@ func _run_all() -> void:
 	_test_seeded_map_resolution_is_reproducible()
 	_test_pursuit_ai_is_stable_and_terrain_aware()
 	await _test_main_scene_gm_panel_and_combat()
+	await _test_focused_stage_auto_playback()
 	await _test_slow_motion_requires_one_step_per_action()
 
 	if _failures == 0:
-		print("PASS: %d checks across 19 squad-combat scenarios." % _checks)
+		print("PASS: %d checks across 22 squad-combat scenarios." % _checks)
 	else:
 		push_error("FAIL: %d of %d checks failed." % [_failures, _checks])
 
@@ -170,6 +173,61 @@ func _test_instant_death_prevents_action() -> void:
 	_expect_equal(result["events"].size(), 1, "dead slower unit loses its action")
 	_expect_equal(result["action_order"], [[&"player", &"killer"]], "only living attacker appears in executed order")
 	_expect_true(not slow.is_alive(), "lethal damage immediately eliminates squad")
+
+
+func _test_turn_schedule_records_actions_and_skips() -> void:
+	var fast = _squad(&"player", &"player", &"player", Vector2i.ZERO, [
+		_unit(&"killer", &"custom", 1, 0, 5, 5, 3),
+		_unit(&"reserve", &"custom", 2, 0, 5, 1, 2),
+	])
+	var slow = _squad(&"enemy", &"enemy", &"npc", Vector2i.ZERO, [
+		_unit(&"victim", &"custom", 1, 0, 3, 99, 1),
+	])
+	var result := _battle(fast, slow, 51)
+	var schedule: Array = result["turn_schedule"]
+	_expect_equal(schedule.size(), 3, "turn schedule retains every unit planned at round start")
+	_expect_equal(schedule[0]["status"], &"acted", "executed unit is marked acted")
+	_expect_equal(schedule[0]["event_index"], 0, "acted schedule entry points at combat event")
+	_expect_equal(schedule[1]["skipped_reason"], &"no_living_enemy", "later ally records enemy-eliminated skip")
+	_expect_equal(schedule[2]["skipped_reason"], &"actor_dead", "killed unit records actor-dead skip")
+
+
+func _test_target_rule_metadata() -> void:
+	var attacker = _squad(&"player", &"player", &"player", Vector2i.ZERO, [
+		_unit(&"a", &"warrior", 1, 0, 20, 1, 5),
+	])
+	var facing = _squad(&"enemy", &"enemy", &"npc", Vector2i.ZERO, [
+		_unit(&"f", &"custom", 1, 0, 20, 1, 1),
+	])
+	var facing_event: Dictionary = _battle(attacker, facing, 52)["events"][0]
+	_expect_equal(facing_event["target_rule"], &"preferred_facing", "preferred facing-column rule is explicit")
+	_expect_equal(facing_event["target_distance"], 0, "facing target records zero horizontal distance")
+
+	attacker = _squad(&"player", &"player", &"player", Vector2i.ZERO, [
+		_unit(&"a", &"warrior", 2, 0, 20, 1, 5),
+	])
+	var nearest = _squad(&"enemy", &"enemy", &"npc", Vector2i.ZERO, [
+		_unit(&"n", &"custom", 0, 0, 20, 1, 1),
+	])
+	var nearest_event: Dictionary = _battle(attacker, nearest, 53)["events"][0]
+	_expect_equal(nearest_event["target_rule"], &"preferred_nearest", "preferred nearest-column rule is explicit")
+	_expect_equal(nearest_event["target_distance"], 2, "nearest target records horizontal distance")
+
+	attacker = _squad(&"player", &"player", &"player", Vector2i.ZERO, [
+		_unit(&"a", &"warrior", 1, 0, 20, 1, 5),
+	])
+	var fallback_facing = _squad(&"enemy", &"enemy", &"npc", Vector2i.ZERO, [
+		_unit(&"b", &"custom", 1, 1, 20, 1, 1),
+	])
+	_expect_equal(_battle(attacker, fallback_facing, 54)["events"][0]["target_rule"], &"fallback_facing", "fallback facing-column rule is explicit")
+
+	attacker = _squad(&"player", &"player", &"player", Vector2i.ZERO, [
+		_unit(&"a", &"warrior", 2, 0, 20, 1, 5),
+	])
+	var fallback_nearest = _squad(&"enemy", &"enemy", &"npc", Vector2i.ZERO, [
+		_unit(&"b", &"custom", 0, 1, 20, 1, 1),
+	])
+	_expect_equal(_battle(attacker, fallback_nearest, 55)["events"][0]["target_rule"], &"fallback_nearest", "fallback nearest-column rule is explicit")
 
 
 func _test_later_unit_retargets_current_battlefield() -> void:
@@ -314,6 +372,35 @@ func _test_main_scene_gm_panel_and_combat() -> void:
 	await get_tree().process_frame
 
 
+func _test_focused_stage_auto_playback() -> void:
+	var main = MainScene.instantiate()
+	add_child(main)
+	await get_tree().process_frame
+	var first = _squad(&"player", &"player", &"player", Vector2i.ZERO, [
+		_unit(&"p", &"warrior", 1, 0, 5, 2, 2),
+	])
+	var second = _squad(&"enemy", &"enemy", &"npc", Vector2i.ZERO, [
+		_unit(&"e", &"tank", 1, 0, 8, 1, 1),
+	])
+	var encounter := _battle(first, second, 61)
+	main._battle_slow_motion_enabled = false
+	main._play_squad_encounter(encounter, {
+		"wave_index": 0, "group_index": 0, "group_count": 2,
+		"pair_index": 0, "pair_count": 1,
+	})
+	await get_tree().process_frame
+	_expect_true(main._battle_overlay.visible, "focused battle stage stays visible during encounter")
+	_expect_true(main._battle_overlay.headline.contains("同步冲突点 1/2"), "stage identifies sequential replay inside simultaneous wave")
+	_expect_true(not main._waiting_for_combat_step, "automatic playback never waits for space")
+	var stage_preview := get_viewport().get_texture().get_image()
+	_expect_equal(stage_preview.save_png(ProjectSettings.globalize_path("res://.godot/focused_stage_preview.png")), OK, "focused battle stage can be captured")
+	await get_tree().create_timer(main.COMBAT_EVENT_DURATION * 3.0 + main.RESULT_HOLD_DURATION).timeout
+	_expect_equal(main._battle_overlay.mode, &"result", "automatic encounter reaches persistent result state before caller closes it")
+	main._battle_overlay.end_encounter()
+	main.queue_free()
+	await get_tree().process_frame
+
+
 func _test_slow_motion_requires_one_step_per_action() -> void:
 	var main = MainScene.instantiate()
 	add_child(main)
@@ -323,36 +410,30 @@ func _test_slow_motion_requires_one_step_per_action() -> void:
 	main._slow_motion_toggle.button_pressed = true
 	_expect_true(main._battle_slow_motion_enabled, "GM toggle enables slow battle")
 
-	var first_event := {
-		"first_id": &"player", "second_id": &"drunk",
-		"attacker_squad_id": &"player", "defender_squad_id": &"drunk",
-		"attacker_unit_id": &"p", "defender_unit_id": &"d",
-		"damage": 1, "defender_squad_health_after": main._actors[&"drunk"].health - 1,
-		"formations_before": {&"player": [], &"drunk": []},
-		"formations_after": {&"player": [], &"drunk": []},
-	}
-	var second_event := first_event.duplicate(true)
-	second_event["attacker_squad_id"] = &"drunk"
-	second_event["defender_squad_id"] = &"player"
-	second_event["attacker_unit_id"] = &"d"
-	second_event["defender_unit_id"] = &"p"
-	second_event["first_id"] = &"drunk"
-	second_event["second_id"] = &"player"
-	second_event["defender_squad_health_after"] = main._actors[&"player"].health - 1
-
-	main._play_combat_event_batch([first_event])
+	var first = _squad(&"player", &"player", &"player", Vector2i.ZERO, [
+		_unit(&"p", &"warrior", 1, 0, 5, 2, 2),
+	])
+	var second = _squad(&"drunk", &"drunk", &"npc", Vector2i.ZERO, [
+		_unit(&"d", &"tank", 1, 0, 8, 1, 1),
+	])
+	var encounter := _battle(first, second, 62)
+	main._play_squad_encounter(encounter, {
+		"wave_index": 0, "group_index": 0, "group_count": 1,
+		"pair_index": 0, "pair_count": 1,
+	})
 	await get_tree().process_frame
 	_expect_true(main._waiting_for_combat_step, "slow battle pauses before first action resolves")
 	main._advance_slow_battle()
-	await get_tree().create_timer(main.COMBAT_EVENT_DURATION * 2.0).timeout
-	_expect_true(not main._waiting_for_combat_step, "one space step releases exactly one unit action")
-
-	main._play_combat_event_batch([second_event])
-	await get_tree().process_frame
+	await get_tree().create_timer(main.COMBAT_EVENT_DURATION * 1.2).timeout
 	_expect_true(main._waiting_for_combat_step, "next unit action pauses again")
 	main._advance_slow_battle()
-	await get_tree().create_timer(main.COMBAT_EVENT_DURATION * 2.0).timeout
-	_expect_true(not main._waiting_for_combat_step, "second space step releases second action")
+	await get_tree().create_timer(main.COMBAT_EVENT_DURATION * 1.2).timeout
+	_expect_true(main._waiting_for_combat_step, "slow battle pauses again on result confirmation")
+	_expect_equal(main._battle_overlay.mode, &"result", "result screen remains visible while awaiting confirmation")
+	main._advance_slow_battle()
+	await get_tree().process_frame
+	_expect_true(not main._waiting_for_combat_step, "extra space confirms result and releases encounter")
+	main._battle_overlay.end_encounter()
 	main.queue_free()
 	await get_tree().process_frame
 

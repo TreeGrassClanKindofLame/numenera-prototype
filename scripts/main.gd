@@ -14,7 +14,13 @@ const BOARD_SIZE := Vector2i(12, 8)
 const CELL_SIZE := 48.0
 const BOARD_ORIGIN := Vector2(24.0, 78.0)
 const APPROACH_DURATION := 0.12
-const COMBAT_EVENT_DURATION := 0.10
+const COMBAT_PREVIEW_DURATION := 0.03
+const COMBAT_STRIKE_DURATION := 0.045
+const COMBAT_IMPACT_DURATION := 0.03
+const COMBAT_DAMAGE_DURATION := 0.045
+const COMBAT_EVENT_DURATION := 0.15
+const ENCOUNTER_TRANSITION_DURATION := 0.10
+const RESULT_HOLD_DURATION := 0.35
 const SETTLE_DURATION := 0.12
 const FAILED_MOVE_BUMP_DISTANCE := 10.0
 const COLLISION_STAGING_DISTANCE := 11.0
@@ -261,65 +267,98 @@ func _apply_approach_animation(
 
 
 func _play_collision_wave(wave: Dictionary) -> void:
-	var max_event_count := 0
-	for group: Dictionary in wave.get("groups", []):
-		max_event_count = maxi(max_event_count, group["combat_events"].size())
+	var groups: Array = wave.get("groups", [])
+	var played_encounter := false
+	for group_index in groups.size():
+		var group: Dictionary = groups[group_index]
+		var encounters: Array = group.get("encounters", [])
+		for pair_index in encounters.size():
+			var encounter: Dictionary = encounters[pair_index]
+			if played_encounter:
+				await get_tree().create_timer(ENCOUNTER_TRANSITION_DURATION).timeout
+			var context := {
+				"wave_index": wave.get("wave_index", 0),
+				"group_index": group_index,
+				"group_count": groups.size(),
+				"pair_index": pair_index,
+				"pair_count": encounters.size(),
+			}
+			if encounter.get("skipped", false):
+				_battle_overlay.show_skipped_encounter(encounter, context)
+				await get_tree().create_timer(COMBAT_EVENT_DURATION).timeout
+				played_encounter = true
+				continue
+			await _play_squad_encounter(encounter, context)
+			played_encounter = true
+	if played_encounter:
+		_battle_overlay.end_encounter()
 
-	# Pair N in every independent group is played together. Pair order inside a
-	# group remains deterministic while coordinate iteration cannot affect timing.
-	for event_index in max_event_count:
-		var event_batch: Array = []
-		for group: Dictionary in wave["groups"]:
-			if event_index < group["combat_events"].size():
-				event_batch.append(group["combat_events"][event_index])
-		await _play_combat_event_batch(event_batch)
+
+func _play_squad_encounter(encounter: Dictionary, context: Dictionary) -> void:
+	_battle_overlay.begin_encounter(encounter, context, _battle_slow_motion_enabled)
+	var events: Array = encounter.get("events", [])
+	for schedule_entry: Dictionary in encounter.get("turn_schedule", []):
+		if schedule_entry.get("status", &"") == &"skipped":
+			_battle_overlay.show_skipped_action(schedule_entry)
+			await get_tree().create_timer(COMBAT_PREVIEW_DURATION).timeout
+			continue
+		var event_index: int = schedule_entry.get("event_index", -1)
+		if event_index < 0 or event_index >= events.size():
+			continue
+		await _play_unit_battle_action(schedule_entry, events[event_index])
+	_battle_overlay.show_result(encounter)
+	_battle_overlay.play_audio_cue(&"result")
+	if _battle_slow_motion_enabled:
+		await _wait_for_combat_step("战斗慢放｜按空格确认战果")
+	else:
+		await get_tree().create_timer(RESULT_HOLD_DURATION).timeout
+
+
+func _play_unit_battle_action(schedule_entry: Dictionary, event: Dictionary) -> void:
+	_battle_overlay.preview_action(schedule_entry, event)
+	if _battle_slow_motion_enabled:
+		await _wait_for_combat_step("战斗慢放｜按空格结算当前单位行动")
+	else:
+		await get_tree().create_timer(COMBAT_PREVIEW_DURATION).timeout
+
+	_battle_overlay.play_audio_cue(&"attack")
+	var strike := create_tween()
+	strike.tween_method(_battle_overlay.set_attack_progress, 0.0, 1.0, COMBAT_STRIKE_DURATION)
+	await strike.finished
+
+	_battle_overlay.play_audio_cue(&"hit")
+	var impact := create_tween()
+	impact.tween_method(_battle_overlay.set_impact_flash, 1.0, 0.0, COMBAT_IMPACT_DURATION)
+	await impact.finished
+
+	var damage := create_tween()
+	damage.tween_method(_battle_overlay.set_damage_progress, 0.0, 1.0, COMBAT_DAMAGE_DURATION)
+	await damage.finished
+	if event.get("target_died", false):
+		_battle_overlay.play_audio_cue(&"death")
+	_battle_overlay.commit_action(event)
 
 
 func _play_combat_event_batch(events: Array) -> void:
-	var visible_events: Array = []
-	var base_positions: Dictionary = {}
+	# Compatibility entry point used by focused animation tests. Production
+	# playback goes through encounters so map pieces never impersonate units.
 	for event: Dictionary in events:
-		var first_id: StringName = event["first_id"]
-		var second_id: StringName = event["second_id"]
-		if not _actor_views.has(first_id) or not _actor_views.has(second_id):
-			continue
-		visible_events.append(event)
-		base_positions[first_id] = _actor_views[first_id].position
-		base_positions[second_id] = _actor_views[second_id].position
-	if visible_events.is_empty():
-		return
-	# Different cells in the same wave still resolve in parallel at the map
-	# layer. The overlay follows the first event while every map squad pulses.
-	_battle_overlay.show_event(visible_events[0])
-	if _battle_slow_motion_enabled:
-		await _wait_for_combat_step()
-
-	var pulse := create_tween()
-	pulse.tween_method(
-		_apply_combat_pulse_batch.bind(visible_events, base_positions),
-		0.0,
-		1.0,
-		COMBAT_EVENT_DURATION
-	)
-	await pulse.finished
-	_battle_overlay.show_event(visible_events[0], true)
-	await get_tree().create_timer(COMBAT_EVENT_DURATION * 0.45).timeout
-
-	for actor_id: StringName in base_positions:
-		if not _actor_views.has(actor_id):
-			continue
-		_actor_views[actor_id].position = base_positions[actor_id]
-		_actor_views[actor_id].set_hit_flash(0.0)
-	for event: Dictionary in visible_events:
-		var defender_id: StringName = event["defender_squad_id"]
-		if _actor_views.has(defender_id):
-			_actor_views[defender_id].set_health(event["defender_squad_health_after"])
-	_battle_overlay.clear_event()
+		var schedule_entry := {
+			"schedule_index": event.get("schedule_index", 0),
+			"squad_id": event.get("attacker_squad_id", &""),
+			"unit_id": event.get("attacker_unit_id", &""),
+			"speed": event.get("speed", 0),
+			"status": &"acted",
+			"event_index": 0,
+		}
+		_battle_overlay.snapshot = event.get("formations_before", {}).duplicate(true)
+		_battle_overlay.show()
+		await _play_unit_battle_action(schedule_entry, event)
 
 
-func _wait_for_combat_step() -> void:
+func _wait_for_combat_step(prompt := "战斗慢放｜按空格结算当前单位行动") -> void:
 	_waiting_for_combat_step = true
-	_status_label.text = "战斗慢放｜按空格结算当前单位行动"
+	_status_label.text = prompt
 	await combat_step_requested
 	_waiting_for_combat_step = false
 	_status_label.text = "正在播放单位行动…"
@@ -342,50 +381,6 @@ func _on_slow_motion_toggled(enabled: bool) -> void:
 func _set_slow_motion_toggle_locked(locked: bool) -> void:
 	if _slow_motion_toggle != null:
 		_slow_motion_toggle.disabled = locked
-
-
-func _apply_combat_pulse_batch(
-	progress: float,
-	events: Array,
-	base_positions: Dictionary
-) -> void:
-	for event: Dictionary in events:
-		_apply_unit_attack_pulse(
-			progress,
-			event["attacker_squad_id"],
-			event["defender_squad_id"],
-			base_positions
-		)
-
-
-func _apply_unit_attack_pulse(
-	progress: float,
-	attacker_id: StringName,
-	defender_id: StringName,
-	base_positions: Dictionary
-) -> void:
-	var strike := sin(progress * PI)
-	var shake := sin(progress * PI * 6.0) * 2.5 * strike
-	var attacker_view = _actor_views[attacker_id]
-	var defender_view = _actor_views[defender_id]
-	var direction: Vector2 = (
-		Vector2(base_positions[defender_id]) - Vector2(base_positions[attacker_id])
-	).normalized()
-	attacker_view.position = base_positions[attacker_id] + direction * 7.0 * strike
-	defender_view.position = base_positions[defender_id] + Vector2(shake, 0.0)
-	attacker_view.set_hit_flash(0.0)
-	defender_view.set_hit_flash(strike)
-
-
-func _apply_combat_pulse(
-	progress: float,
-	first_id: StringName,
-	second_id: StringName,
-	base_positions: Dictionary
-) -> void:
-	# Compatibility wrapper retained for older callers; the first actor is the
-	# attacker and the second actor is the defender in the squad rules.
-	_apply_unit_attack_pulse(progress, first_id, second_id, base_positions)
 
 
 func _play_wave_settle(wave: Dictionary, next_wave: Dictionary) -> void:

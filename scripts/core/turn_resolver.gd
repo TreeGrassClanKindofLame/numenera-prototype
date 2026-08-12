@@ -221,9 +221,18 @@ static func _resolve_collision_wave(
 					"pair_index": pair_index,
 					"first_squad_id": first_id,
 					"second_squad_id": second_id,
+					"first_controller": first.controller,
+					"second_controller": second.controller,
 					"skipped": true,
 					"reason": &"eliminated_squad",
 					"events": [],
+					"turn_schedule": [],
+					"formations_before": SquadBattleResolverType.formation_snapshot(first, second),
+					"formations_after": SquadBattleResolverType.formation_snapshot(first, second),
+					"first_alive_before": first.living_unit_count(),
+					"second_alive_before": second.living_unit_count(),
+					"first_alive_after": first.living_unit_count(),
+					"second_alive_after": second.living_unit_count(),
 				})
 				continue
 
