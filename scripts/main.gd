@@ -1,10 +1,14 @@
 extends Node2D
 
+signal combat_step_requested
+
 const TurnIntentType = preload("res://scripts/model/turn_intent.gd")
 const GridActorStateType = preload("res://scripts/model/grid_actor_state.gd")
+const SquadUnitStateType = preload("res://scripts/model/squad_unit_state.gd")
 const TurnResolverType = preload("res://scripts/core/turn_resolver.gd")
 const DrunkControllerType = preload("res://scripts/core/drunk_controller.gd")
 const CharacterViewType = preload("res://scripts/ui/character_view.gd")
+const BattleOverlayType = preload("res://scripts/ui/battle_overlay.gd")
 
 const BOARD_SIZE := Vector2i(12, 8)
 const CELL_SIZE := 48.0
@@ -15,6 +19,7 @@ const SETTLE_DURATION := 0.12
 const FAILED_MOVE_BUMP_DISTANCE := 10.0
 const COLLISION_STAGING_DISTANCE := 11.0
 const RNG_SEED := 1337
+const UNIT_CLASS_CYCLE := [&"", &"tank", &"warrior", &"archer", &"assassin"]
 const ACTOR_ORDER := [&"player", &"drunk"]
 const MAP_ROWS := [
 	"############",
@@ -48,6 +53,12 @@ var _drunk_controller = DrunkControllerType.new(RNG_SEED)
 var _turn_label: Label
 var _status_label: Label
 var _log_label: Label
+var _formation_labels: Dictionary = {}
+var _selected_squad_id: StringName = &"player"
+var _battle_overlay
+var _battle_slow_motion_enabled := false
+var _waiting_for_combat_step := false
+var _slow_motion_toggle: CheckButton
 
 
 func _ready() -> void:
@@ -55,15 +66,25 @@ func _ready() -> void:
 	_ensure_input_actions()
 	_build_actor_views()
 	_build_interface()
+	_battle_overlay = BattleOverlayType.new()
+	add_child(_battle_overlay)
+	_battle_overlay.setup()
 	_update_interface("等待玩家输入", "尚未结算。")
 	queue_redraw()
 
 
 func _unhandled_input(event: InputEvent) -> void:
-	if _busy or not _actors.has(&"player") or not event is InputEventKey:
+	if not event is InputEventKey:
 		return
 	var key_event := event as InputEventKey
 	if not key_event.pressed or key_event.echo:
+		return
+	if _waiting_for_combat_step:
+		if key_event.keycode == KEY_SPACE or key_event.physical_keycode == KEY_SPACE:
+			get_viewport().set_input_as_handled()
+			_advance_slow_battle()
+		return
+	if _busy or not _actors.has(&"player"):
 		return
 
 	var player_intent = null
@@ -88,11 +109,15 @@ func _play_turn(player_intent) -> void:
 	if _busy or not _actors.has(&"player"):
 		return
 	_busy = true
+	_set_slow_motion_toggle_locked(true)
 	_update_interface("正在结算第 %d 回合…" % _turn_number, _log_label.text)
 
 	var intents: Dictionary = {&"player": player_intent}
 	if _actors.has(&"drunk"):
-		intents[&"drunk"] = _drunk_controller.choose_intent(&"drunk")
+		intents[&"drunk"] = _drunk_controller.choose_pursuit_intent(
+			&"drunk", _actors[&"drunk"].cell, _actors[&"player"].cell,
+			_blocked, BOARD_SIZE
+		)
 
 	var actor_states: Array = []
 	for actor_id: StringName in _active_actor_ids():
@@ -101,7 +126,9 @@ func _play_turn(player_intent) -> void:
 			intents[actor_id] = _wait_intent(actor_id)
 
 	var resolved_turn := _turn_number
-	var resolution = TurnResolverType.resolve(BOARD_SIZE, _blocked, actor_states, intents)
+	var resolution = TurnResolverType.resolve(
+		BOARD_SIZE, _blocked, actor_states, intents, RNG_SEED + resolved_turn
+	)
 	var turn_log := _format_turn_log(resolved_turn, intents, resolution)
 	var animation_starts: Dictionary = {}
 	for actor_id: StringName in _active_actor_ids():
@@ -114,13 +141,15 @@ func _play_turn(player_intent) -> void:
 		var actor = _actors[actor_id]
 		var view = _actor_views[actor_id]
 		view.position = _cell_to_world(actor.cell)
-		view.set_stats(actor.health, actor.max_health, actor.attack)
+		view.set_squad_stats(actor.health, actor.max_health, actor.attack, actor.living_unit_count())
 		view.reset_visual_state()
 
 	_turn_number += 1
 	_busy = false
+	_set_slow_motion_toggle_locked(false)
 	var status := "等待玩家输入" if _actors.has(&"player") else "主角已死亡，原型结束"
 	_update_interface(status, turn_log)
+	_refresh_formation_panel()
 
 
 func _play_resolution_animation(
@@ -259,6 +288,11 @@ func _play_combat_event_batch(events: Array) -> void:
 		base_positions[second_id] = _actor_views[second_id].position
 	if visible_events.is_empty():
 		return
+	# Different cells in the same wave still resolve in parallel at the map
+	# layer. The overlay follows the first event while every map squad pulses.
+	_battle_overlay.show_event(visible_events[0])
+	if _battle_slow_motion_enabled:
+		await _wait_for_combat_step()
 
 	var pulse := create_tween()
 	pulse.tween_method(
@@ -268,6 +302,8 @@ func _play_combat_event_batch(events: Array) -> void:
 		COMBAT_EVENT_DURATION
 	)
 	await pulse.finished
+	_battle_overlay.show_event(visible_events[0], true)
+	await get_tree().create_timer(COMBAT_EVENT_DURATION * 0.45).timeout
 
 	for actor_id: StringName in base_positions:
 		if not _actor_views.has(actor_id):
@@ -275,8 +311,37 @@ func _play_combat_event_batch(events: Array) -> void:
 		_actor_views[actor_id].position = base_positions[actor_id]
 		_actor_views[actor_id].set_hit_flash(0.0)
 	for event: Dictionary in visible_events:
-		_actor_views[event["first_id"]].set_health(event["first_health_after"])
-		_actor_views[event["second_id"]].set_health(event["second_health_after"])
+		var defender_id: StringName = event["defender_squad_id"]
+		if _actor_views.has(defender_id):
+			_actor_views[defender_id].set_health(event["defender_squad_health_after"])
+	_battle_overlay.clear_event()
+
+
+func _wait_for_combat_step() -> void:
+	_waiting_for_combat_step = true
+	_status_label.text = "战斗慢放｜按空格结算当前单位行动"
+	await combat_step_requested
+	_waiting_for_combat_step = false
+	_status_label.text = "正在播放单位行动…"
+
+
+func _advance_slow_battle() -> void:
+	if not _waiting_for_combat_step:
+		return
+	_waiting_for_combat_step = false
+	combat_step_requested.emit()
+
+
+func _on_slow_motion_toggled(enabled: bool) -> void:
+	if _busy:
+		_slow_motion_toggle.set_pressed_no_signal(_battle_slow_motion_enabled)
+		return
+	_battle_slow_motion_enabled = enabled
+
+
+func _set_slow_motion_toggle_locked(locked: bool) -> void:
+	if _slow_motion_toggle != null:
+		_slow_motion_toggle.disabled = locked
 
 
 func _apply_combat_pulse_batch(
@@ -285,12 +350,31 @@ func _apply_combat_pulse_batch(
 	base_positions: Dictionary
 ) -> void:
 	for event: Dictionary in events:
-		_apply_combat_pulse(
+		_apply_unit_attack_pulse(
 			progress,
-			event["first_id"],
-			event["second_id"],
+			event["attacker_squad_id"],
+			event["defender_squad_id"],
 			base_positions
 		)
+
+
+func _apply_unit_attack_pulse(
+	progress: float,
+	attacker_id: StringName,
+	defender_id: StringName,
+	base_positions: Dictionary
+) -> void:
+	var strike := sin(progress * PI)
+	var shake := sin(progress * PI * 6.0) * 2.5 * strike
+	var attacker_view = _actor_views[attacker_id]
+	var defender_view = _actor_views[defender_id]
+	var direction: Vector2 = (
+		Vector2(base_positions[defender_id]) - Vector2(base_positions[attacker_id])
+	).normalized()
+	attacker_view.position = base_positions[attacker_id] + direction * 7.0 * strike
+	defender_view.position = base_positions[defender_id] + Vector2(shake, 0.0)
+	attacker_view.set_hit_flash(0.0)
+	defender_view.set_hit_flash(strike)
 
 
 func _apply_combat_pulse(
@@ -299,14 +383,9 @@ func _apply_combat_pulse(
 	second_id: StringName,
 	base_positions: Dictionary
 ) -> void:
-	var flash := sin(progress * PI)
-	var shake := sin(progress * PI * 4.0) * 2.5
-	var first_view = _actor_views[first_id]
-	var second_view = _actor_views[second_id]
-	first_view.position = base_positions[first_id] + Vector2(shake, 0.0)
-	second_view.position = base_positions[second_id] - Vector2(shake, 0.0)
-	first_view.set_hit_flash(flash)
-	second_view.set_hit_flash(flash)
+	# Compatibility wrapper retained for older callers; the first actor is the
+	# attacker and the second actor is the defender in the squad rules.
+	_apply_unit_attack_pulse(progress, first_id, second_id, base_positions)
 
 
 func _play_wave_settle(wave: Dictionary, next_wave: Dictionary) -> void:
@@ -361,9 +440,42 @@ func _parse_map() -> void:
 						&"player", cell, &"player", &"player", 5, 5, 2
 					)
 				"D":
-					_actors[&"drunk"] = GridActorStateType.new(
-						&"drunk", cell, &"npc", &"drunk", 3, 3, 1
+					_actors[&"drunk"] = _make_default_squad(
+						&"drunk", cell, &"npc", &"drunk"
 					)
+	if _actors.has(&"player"):
+		var player_cell: Vector2i = _actors[&"player"].cell
+		_actors[&"player"] = _make_default_squad(
+			&"player", player_cell, &"player", &"player"
+		)
+
+
+func _make_default_squad(
+	actor_id: StringName,
+	cell: Vector2i,
+	controller: StringName,
+	faction: StringName
+):
+	var unit_specs := [
+		[&"tank", Vector2i(0, 0)],
+		[&"warrior", Vector2i(1, 0)],
+		[&"archer", Vector2i(1, 1)],
+		[&"assassin", Vector2i(2, 1)],
+	]
+	if actor_id == &"drunk":
+		unit_specs = [
+			[&"warrior", Vector2i(0, 0)],
+			[&"tank", Vector2i(2, 0)],
+			[&"assassin", Vector2i(0, 1)],
+			[&"archer", Vector2i(2, 1)],
+		]
+	var units: Array = []
+	for index in unit_specs.size():
+		var spec: Array = unit_specs[index]
+		units.append(SquadUnitStateType.create_for_class(
+			StringName("%s_%d" % [actor_id, index]), spec[0], spec[1]
+		))
+	return GridActorStateType.new(actor_id, cell, controller, faction, 1, 1, 1, units)
 
 
 func _active_actor_ids() -> Array:
@@ -409,6 +521,7 @@ func _build_actor_views() -> void:
 			actor.max_health,
 			actor.attack
 		)
+		view.set_squad_stats(actor.health, actor.max_health, actor.attack, actor.living_unit_count())
 		view.position = _cell_to_world(actor.cell)
 		_actor_views[actor_id] = view
 		add_child(view)
@@ -434,20 +547,93 @@ func _build_interface() -> void:
 		Vector2(644.0, 151.0), Vector2(268.0, 78.0), 15, COLOR_TEXT
 	))
 	add_child(_make_label(
-		"角色\n● 主角　HP 5　ATK 2\n● 酒鬼　HP 3　ATK 1",
-		Vector2(644.0, 232.0), Vector2(268.0, 82.0), 15, COLOR_TEXT
+		"GM编队面板｜点击标题切换小队\n每格点击：空→肉→战→射→刺→空",
+		Vector2(644.0, 224.0), Vector2(330.0, 46.0), 14, COLOR_TEXT
 	))
+	_slow_motion_toggle = CheckButton.new()
+	_slow_motion_toggle.text = "战斗慢放｜空格逐步"
+	_slow_motion_toggle.position = Vector2(960.0, 274.0)
+	_slow_motion_toggle.size = Vector2(208.0, 30.0)
+	_slow_motion_toggle.button_pressed = false
+	_slow_motion_toggle.toggled.connect(_on_slow_motion_toggled)
+	add_child(_slow_motion_toggle)
+	_build_formation_panel()
 	add_child(_make_label(
 		"上一回合",
-		Vector2(644.0, 321.0), Vector2(268.0, 24.0), 17, COLOR_TEXT
+		Vector2(644.0, 465.0), Vector2(520.0, 24.0), 17, COLOR_TEXT
 	))
-	_log_label = _make_label("", Vector2(644.0, 350.0), Vector2(268.0, 132.0), 13, COLOR_MUTED)
+	_log_label = _make_label("", Vector2(644.0, 494.0), Vector2(520.0, 184.0), 12, COLOR_MUTED)
 	_log_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	add_child(_log_label)
-	add_child(_make_label(
-		"RNG seed: %d" % RNG_SEED,
-		Vector2(644.0, 488.0), Vector2(268.0, 22.0), 13, COLOR_MUTED
-	))
+
+
+func _build_formation_panel() -> void:
+	var select_player := Button.new()
+	select_player.text = "主角小队"
+	select_player.position = Vector2(644.0, 274.0)
+	select_player.size = Vector2(150.0, 30.0)
+	select_player.pressed.connect(_select_formation_squad.bind(&"player"))
+	add_child(select_player)
+	var select_enemy := Button.new()
+	select_enemy.text = "酒鬼小队"
+	select_enemy.position = Vector2(802.0, 274.0)
+	select_enemy.size = Vector2(150.0, 30.0)
+	select_enemy.pressed.connect(_select_formation_squad.bind(&"drunk"))
+	add_child(select_enemy)
+	for row in 2:
+		for column in 3:
+			var slot := Vector2i(column, row)
+			var button := Button.new()
+			button.position = Vector2(644.0 + column * 104.0, 312.0 + row * 62.0)
+			button.size = Vector2(96.0, 54.0)
+			button.pressed.connect(_cycle_formation_slot.bind(slot))
+			_formation_labels[slot] = button
+			add_child(button)
+	_refresh_formation_panel()
+
+
+func _select_formation_squad(actor_id: StringName) -> void:
+	if _busy or not _actors.has(actor_id):
+		return
+	_selected_squad_id = actor_id
+	_refresh_formation_panel()
+
+
+func _cycle_formation_slot(slot: Vector2i) -> void:
+	if _busy or not _actors.has(_selected_squad_id):
+		return
+	var squad = _actors[_selected_squad_id]
+	var existing = squad.unit_at(slot)
+	var current_class: StringName = existing.unit_class if existing != null else &""
+	var current_index := UNIT_CLASS_CYCLE.find(current_class)
+	for offset in range(1, UNIT_CLASS_CYCLE.size() + 1):
+		var next_class: StringName = UNIT_CLASS_CYCLE[(current_index + offset) % UNIT_CLASS_CYCLE.size()]
+		if next_class != &"" and existing == null and squad.living_unit_count() >= 4:
+			continue
+		squad.set_unit_at(slot, next_class)
+		break
+	_refresh_formation_panel()
+	if _actor_views.has(_selected_squad_id):
+		_actor_views[_selected_squad_id].set_squad_stats(
+			squad.health, squad.max_health, squad.attack, squad.living_unit_count()
+		)
+
+
+func _refresh_formation_panel() -> void:
+	if _formation_labels.is_empty() or not _actors.has(_selected_squad_id):
+		return
+	var squad = _actors[_selected_squad_id]
+	for slot: Vector2i in _formation_labels:
+		var button: Button = _formation_labels[slot]
+		var unit = squad.unit_at(slot)
+		var row_name := "前" if slot.y == 0 else "后"
+		if unit == null:
+			button.text = "%s%d｜空" % [row_name, slot.x + 1]
+		else:
+			button.text = "%s%d｜%s\nHP%d 攻%d 速%d" % [
+				row_name, slot.x + 1, unit.class_name_zh(),
+				maxi(unit.health, 0), unit.attack, unit.speed,
+			]
 
 
 func _make_label(
@@ -489,13 +675,14 @@ func _format_turn_log(turn_index: int, intents: Dictionary, resolution) -> Strin
 				lines.append("  同阵营：跳过战斗")
 			for event: Dictionary in group["combat_events"]:
 				lines.append(
-					"  %s %d→%d ↔ %s %d→%d" % [
-						_actor_name(event["first_id"]),
-						event["first_health_before"],
-						event["first_health_after"],
-						_actor_name(event["second_id"]),
-						event["second_health_before"],
-						event["second_health_after"],
+					"  %s/%s → %s/%s  %d→%d%s" % [
+						_actor_name(event["attacker_squad_id"]),
+						String(event["attacker_unit_id"]),
+						_actor_name(event["defender_squad_id"]),
+						String(event["defender_unit_id"]),
+						event["health_before"],
+						event["health_after"],
+						" 死亡" if event["target_died"] else "",
 					]
 				)
 			if not group["dead_actor_ids"].is_empty():
@@ -585,8 +772,8 @@ func _grid_point_to_world(grid_point: Vector2) -> Vector2:
 
 
 func _draw() -> void:
-	draw_rect(Rect2(Vector2.ZERO, Vector2(960.0, 540.0)), COLOR_BACKGROUND)
-	draw_rect(Rect2(Vector2(620.0, 24.0), Vector2(316.0, 492.0)), COLOR_PANEL)
+	draw_rect(Rect2(Vector2.ZERO, Vector2(1200.0, 720.0)), COLOR_BACKGROUND)
+	draw_rect(Rect2(Vector2(620.0, 24.0), Vector2(556.0, 672.0)), COLOR_PANEL)
 
 	for y in BOARD_SIZE.y:
 		for x in BOARD_SIZE.x:

@@ -6,6 +6,7 @@ var health := 1
 var max_health := 1
 var attack := 0
 var hit_flash := 0.0
+var squad_size := 1
 
 
 func setup(
@@ -32,6 +33,11 @@ func set_health(p_health: int) -> void:
 	queue_redraw()
 
 
+func set_squad_stats(p_health: int, p_max_health: int, p_attack: int, p_squad_size: int) -> void:
+	squad_size = p_squad_size
+	set_stats(p_health, p_max_health, p_attack)
+
+
 func set_hit_flash(amount: float) -> void:
 	hit_flash = clampf(amount, 0.0, 1.0)
 	queue_redraw()
@@ -49,7 +55,7 @@ func _draw() -> void:
 	draw_circle(Vector2.ZERO, radius, display_color)
 	draw_circle(Vector2.ZERO, radius, Color(1.0, 1.0, 1.0, 0.9), false, 2.0, true)
 
-	var stat_text := "HP%d/%d  ATK%d" % [maxi(health, 0), max_health, attack]
+	var stat_text := "%d人  HP%d/%d" % [squad_size, maxi(health, 0), max_health]
 	draw_string(
 		ThemeDB.fallback_font,
 		Vector2(-45.0, -23.0),

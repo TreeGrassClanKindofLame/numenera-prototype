@@ -2,6 +2,7 @@ extends RefCounted
 
 const TurnIntentType = preload("res://scripts/model/turn_intent.gd")
 const TurnResolutionType = preload("res://scripts/model/turn_resolution.gd")
+const SquadBattleResolverType = preload("res://scripts/core/squad_battle_resolver.gd")
 
 const VALID_DELTAS := [
 	Vector2i.UP,
@@ -15,8 +16,11 @@ static func resolve(
 	board_size: Vector2i,
 	blocked: Dictionary,
 	actor_states: Array,
-	intents: Dictionary
+	intents: Dictionary,
+	battle_seed: int = 1337
 ):
+	var battle_rng := RandomNumberGenerator.new()
+	battle_rng.seed = battle_seed
 	var states: Dictionary = {}
 	var actor_ids: Array = []
 	var initial_positions: Dictionary = {}
@@ -98,7 +102,8 @@ static func resolve(
 			last_sources,
 			actor_reasons,
 			dead_actor_ids,
-			result
+			result,
+			battle_rng
 		)
 		result.collision_waves.append(edge_wave)
 		next_wave_index += 1
@@ -140,7 +145,8 @@ static func resolve(
 			last_sources,
 			actor_reasons,
 			dead_actor_ids,
-			result
+			result,
+			battle_rng
 		)
 		result.collision_waves.append(grid_wave)
 		next_wave_index += 1
@@ -180,7 +186,8 @@ static func _resolve_collision_wave(
 	last_sources: Dictionary,
 	actor_reasons: Dictionary,
 	dead_actor_ids: Array,
-	result
+	result,
+	battle_rng: RandomNumberGenerator
 ) -> Dictionary:
 	var wave := {
 		"wave_index": wave_index,
@@ -201,30 +208,41 @@ static func _resolve_collision_wave(
 		var ordered := _sort_participants(participants, center, last_sources)
 		var hostile_pairs := _hostile_pairs(ordered, states)
 		var group_events: Array = []
+		var encounters: Array = []
 
-		for pair: Array in hostile_pairs:
+		for pair_index in hostile_pairs.size():
+			var pair: Array = hostile_pairs[pair_index]
 			var first_id: StringName = pair[0]
 			var second_id: StringName = pair[1]
 			var first = states[first_id]
 			var second = states[second_id]
-			var event := {
-				"wave_index": wave_index,
-				"group_index": group_index,
-				"kind": kind,
-				"center": center,
-				"first_id": first_id,
-				"second_id": second_id,
-				"damage_to_first": second.attack,
-				"damage_to_second": first.attack,
-				"first_health_before": first.health,
-				"second_health_before": second.health,
-			}
-			first.health -= second.attack
-			second.health -= first.attack
-			event["first_health_after"] = first.health
-			event["second_health_after"] = second.health
-			group_events.append(event)
-			result.combat_events.append(event)
+			if not first.is_alive() or not second.is_alive():
+				encounters.append({
+					"pair_index": pair_index,
+					"first_squad_id": first_id,
+					"second_squad_id": second_id,
+					"skipped": true,
+					"reason": &"eliminated_squad",
+					"events": [],
+				})
+				continue
+
+			var encounter: Dictionary = SquadBattleResolverType.resolve_round(
+				first, second, battle_rng
+			)
+			encounter["pair_index"] = pair_index
+			encounter["skipped"] = false
+			for unit_event: Dictionary in encounter["events"]:
+				unit_event["wave_index"] = wave_index
+				unit_event["group_index"] = group_index
+				unit_event["pair_index"] = pair_index
+				unit_event["kind"] = kind
+				unit_event["center"] = center
+				unit_event["first_id"] = unit_event["attacker_squad_id"]
+				unit_event["second_id"] = unit_event["defender_squad_id"]
+				group_events.append(unit_event)
+				result.combat_events.append(unit_event)
+			encounters.append(encounter)
 
 		var survivors: Array = []
 		var group_dead: Array = []
@@ -261,13 +279,15 @@ static func _resolve_collision_wave(
 		for actor_id: StringName in ordered:
 			source_snapshot[actor_id] = last_sources[actor_id]
 		var group_result := {
-			"wave_index": wave_index,
-			"group_index": group_index,
-			"kind": kind,
-			"center": center,
+				"wave_index": wave_index,
+				"group_index": group_index,
+				"kind": kind,
+				"center": center,
 			"cell": spec.get("cell", Vector2i(-1, -1)),
 			"participants": ordered,
 			"source_positions": source_snapshot,
+			"planned_pairs": hostile_pairs,
+			"encounters": encounters,
 			"combat_events": group_events,
 			"survivors": survivors,
 			"returned_actor_ids": returned,
