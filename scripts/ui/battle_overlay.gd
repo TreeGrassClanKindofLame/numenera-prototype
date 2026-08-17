@@ -24,6 +24,7 @@ var bottom_squad_id: StringName = &""
 var top_squad_id: StringName = &""
 var headline := ""
 var detail_text := ""
+var engagement_text := ""
 var result_text := ""
 var mode: StringName = &"hidden"
 var slow_motion := false
@@ -53,6 +54,7 @@ func begin_encounter(p_encounter: Dictionary, p_context: Dictionary, p_slow_moti
 	_reset_action_visuals()
 	_assign_sides()
 	headline = _context_title()
+	engagement_text = _engagement_summary()
 	detail_text = "准备自动战斗"
 	result_text = ""
 	mode = &"battle"
@@ -72,10 +74,12 @@ func preview_action(schedule_entry: Dictionary, event: Dictionary) -> void:
 	damage_progress = 0.0
 	impact_flash = 0.0
 	target_died = event.get("target_died", false)
-	detail_text = _target_reason_text(event) if slow_motion else "%s 准备攻击 %s" % [
+	var phase_text := "第零回合" if event.get("phase", &"round_one") == &"round_zero" else "第一回合"
+	var action_text: String = _target_reason_text(event) if slow_motion else "%s 准备攻击 %s" % [
 		_unit_display_name(attacker_squad_id, attacker_unit_id),
 		_unit_display_name(defender_squad_id, defender_unit_id),
 	]
+	detail_text = "%s｜%s" % [phase_text, action_text]
 	mode = &"battle"
 	queue_redraw()
 
@@ -112,7 +116,9 @@ func show_skipped_action(schedule_entry: Dictionary) -> void:
 	current_schedule_index = schedule_entry.get("schedule_index", -1)
 	active_event.clear()
 	_reset_action_visuals()
-	detail_text = "%s：%s" % [
+	var phase_text := "第零回合" if schedule_entry.get("phase", &"round_one") == &"round_zero" else "第一回合"
+	detail_text = "%s｜%s：%s" % [
+		phase_text,
 		_unit_display_name(schedule_entry.get("squad_id", &""), schedule_entry.get("unit_id", &"")),
 		_skip_reason_text(schedule_entry.get("skipped_reason", &"")),
 	]
@@ -182,6 +188,7 @@ func _draw() -> void:
 	draw_rect(QUEUE_RECT, Color("344b68"), false, 2.0)
 	draw_string(ThemeDB.fallback_font, Vector2(58.0, 69.0), headline, HORIZONTAL_ALIGNMENT_LEFT, 780.0, 22, Color.WHITE)
 	draw_string(ThemeDB.fallback_font, Vector2(58.0, 94.0), detail_text, HORIZONTAL_ALIGNMENT_LEFT, 780.0, 14, Color("dbe7f7"))
+	draw_string(ThemeDB.fallback_font, Vector2(88.0, 124.0), engagement_text, HORIZONTAL_ALIGNMENT_LEFT, 740.0, 13, Color("ffe38a"))
 	draw_string(ThemeDB.fallback_font, Vector2(910.0, 134.0), "行动队列", HORIZONTAL_ALIGNMENT_LEFT, 200.0, 20, Color.WHITE)
 
 	_draw_formation(top_squad_id, false)
@@ -243,7 +250,8 @@ func _draw_unit_card(squad_id: StringName, unit: Dictionary, rect: Rect2) -> voi
 		card_rect.position.x += sin(impact_flash * PI * 6.0) * 4.0
 	draw_rect(card_rect, color, true)
 	draw_rect(card_rect, Color("ffdf75") if is_attacker else Color("ff6570") if is_defender else Color("71859e"), false, 4.0 if is_attacker or is_defender else 1.0)
-	draw_string(ThemeDB.fallback_font, card_rect.position + Vector2(8.0, 24.0), _class_short(unit.get("unit_class", &"")), HORIZONTAL_ALIGNMENT_LEFT, card_rect.size.x - 16.0, 17, Color.WHITE)
+	var class_label: String = "木桩" if squad_id == &"dummy" and unit.get("unit_class", &"") == SquadUnitStateType.CLASS_CUSTOM else _class_short(unit.get("unit_class", &""))
+	draw_string(ThemeDB.fallback_font, card_rect.position + Vector2(8.0, 24.0), class_label, HORIZONTAL_ALIGNMENT_LEFT, card_rect.size.x - 16.0, 17, Color.WHITE)
 	draw_string(ThemeDB.fallback_font, card_rect.position + Vector2(8.0, 45.0), "攻%d　速%d" % [unit.get("attack", 0), unit.get("speed", 0)], HORIZONTAL_ALIGNMENT_LEFT, card_rect.size.x - 16.0, 12, Color("e1e9f3"))
 	var health_value: float = unit.get("health", 0)
 	if is_defender and not active_event.is_empty() and damage_progress < 1.0:
@@ -300,7 +308,8 @@ func _draw_action_queue() -> void:
 		draw_rect(rect, background, true)
 		draw_rect(rect, Color("3b516b"), false, 1.0)
 		var prefix := "▶" if state == &"current" else "×" if state == &"skipped" else "✓" if state == &"acted" else "%d" % (index + 1)
-		var label := "%s  %s　速%d" % [prefix, _unit_display_name(entry.get("squad_id", &""), entry.get("unit_id", &"")), entry.get("speed", 0)]
+		var phase_mark := "零" if entry.get("phase", &"round_one") == &"round_zero" else "一"
+		var label := "%s[%s] %s　速%d" % [prefix, phase_mark, _unit_display_name(entry.get("squad_id", &""), entry.get("unit_id", &"")), entry.get("speed", 0)]
 		draw_string(ThemeDB.fallback_font, rect.position + Vector2(8.0, 17.0), label, HORIZONTAL_ALIGNMENT_LEFT, 202.0, 12, text_color)
 		if state == &"skipped":
 			draw_string(ThemeDB.fallback_font, rect.position + Vector2(8.0, 34.0), _skip_reason_text(entry.get("skipped_reason", &"")), HORIZONTAL_ALIGNMENT_LEFT, 202.0, 10, text_color)
@@ -364,6 +373,42 @@ func _context_title() -> String:
 	]
 
 
+func _engagement_summary() -> String:
+	var data: Dictionary = encounter.get("engagement", {})
+	if data.is_empty():
+		return "接敌方向：无"
+	var first_contact: Dictionary = data.get("first_contact", {})
+	var second_contact: Dictionary = data.get("second_contact", {})
+	var first_id: StringName = encounter.get("first_squad_id", &"")
+	var second_id: StringName = encounter.get("second_squad_id", &"")
+	var verdict := "均无优势"
+	if encounter.get("first_advantage", 0) > 0:
+		verdict = "%s 获得%d点优势" % [
+			_squad_display_name(first_id), encounter.get("first_advantage", 0)
+		]
+	elif encounter.get("second_advantage", 0) > 0:
+		verdict = "%s 获得%d点优势" % [
+			_squad_display_name(second_id), encounter.get("second_advantage", 0)
+		]
+	return "接敌：%s %s%d vs %s %s%d → %s" % [
+		_squad_display_name(first_id),
+		_contact_side_text(first_contact.get("side", &"front")),
+		first_contact.get("score", 2),
+		_squad_display_name(second_id),
+		_contact_side_text(second_contact.get("side", &"front")),
+		second_contact.get("score", 2),
+		verdict,
+	]
+
+
+func _contact_side_text(side: StringName) -> String:
+	match side:
+		&"front": return "正面"
+		&"side": return "侧面"
+		&"back": return "背面"
+	return "未知"
+
+
 func _target_reason_text(event: Dictionary) -> String:
 	var preferred := "前排" if event.get("preferred_row", 0) == 0 else "后排"
 	var selected := "前排" if event.get("selected_row", 0) == 0 else "后排"
@@ -395,7 +440,7 @@ func _unit_display_name(squad_id: StringName, unit_id: StringName) -> String:
 	if snapshot.has(squad_id):
 		for unit: Dictionary in snapshot[squad_id]:
 			if unit.get("unit_id", &"") == unit_id:
-				class_text = _class_short(unit.get("unit_class", &""))
+				class_text = "木桩" if squad_id == &"dummy" and unit.get("unit_class", &"") == SquadUnitStateType.CLASS_CUSTOM else _class_short(unit.get("unit_class", &""))
 				break
 	return "%s/%s" % [_squad_display_name(squad_id), class_text]
 
@@ -403,7 +448,7 @@ func _unit_display_name(squad_id: StringName, unit_id: StringName) -> String:
 func _squad_display_name(squad_id: StringName) -> String:
 	match squad_id:
 		&"player": return "主角小队"
-		&"drunk": return "酒鬼小队"
+		&"dummy": return "木桩小队"
 	return String(squad_id)
 
 

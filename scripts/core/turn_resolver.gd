@@ -62,6 +62,9 @@ static func resolve(
 			movement_result["reason"] = &"invalid_direction"
 			actor_reasons[actor_id] = &"invalid_direction"
 		else:
+			# Facing follows the declared move before terrain validation. Bumping a
+			# wall is therefore a valid way to turn without changing cells.
+			states[actor_id].facing = intent.delta
 			var target: Vector2i = start + intent.delta
 			movement_result["target"] = target
 			if not _is_inside(target, board_size):
@@ -80,6 +83,7 @@ static func resolve(
 				current_positions[actor_id] = target
 				last_sources[actor_id] = Vector2(start)
 
+		movement_result["facing"] = states[actor_id].facing
 		result.movement_results[actor_id] = movement_result
 		result.movement_positions[actor_id] = current_positions[actor_id]
 		result.tentative_positions[actor_id] = current_positions[actor_id]
@@ -233,11 +237,22 @@ static func _resolve_collision_wave(
 					"second_alive_before": second.living_unit_count(),
 					"first_alive_after": first.living_unit_count(),
 					"second_alive_after": second.living_unit_count(),
+					"first_advantage": 0,
+					"second_advantage": 0,
+					"engagement": {},
 				})
 				continue
 
+			var engagement := _build_engagement(
+				first_id, second_id, center, last_sources, states
+			)
 			var encounter: Dictionary = SquadBattleResolverType.resolve_round(
-				first, second, battle_rng
+				first,
+				second,
+				battle_rng,
+				engagement["first_advantage"],
+				engagement["second_advantage"],
+				engagement
 			)
 			encounter["pair_index"] = pair_index
 			encounter["skipped"] = false
@@ -437,6 +452,68 @@ static func _health_snapshot(current_positions: Dictionary, states: Dictionary) 
 	return snapshot
 
 
+static func _build_engagement(
+	first_id: StringName,
+	second_id: StringName,
+	center: Vector2,
+	source_positions: Dictionary,
+	states: Dictionary
+) -> Dictionary:
+	var first_contact := _contact_info(
+		first_id, second_id, center, source_positions, states
+	)
+	var second_contact := _contact_info(
+		second_id, first_id, center, source_positions, states
+	)
+	var first_score: int = first_contact["score"]
+	var second_score: int = second_contact["score"]
+	return {
+		"first_squad_id": first_id,
+		"second_squad_id": second_id,
+		"first_contact": first_contact,
+		"second_contact": second_contact,
+		"first_score": first_score,
+		"second_score": second_score,
+		"first_advantage": maxi(first_score - second_score, 0),
+		"second_advantage": maxi(second_score - first_score, 0),
+	}
+
+
+static func _contact_info(
+	actor_id: StringName,
+	opponent_id: StringName,
+	center: Vector2,
+	source_positions: Dictionary,
+	states: Dictionary
+) -> Dictionary:
+	var source: Vector2 = source_positions[actor_id]
+	var opponent_source: Vector2 = source_positions[opponent_id]
+	var contact_direction := center - source
+	var used_opponent_source := false
+	if contact_direction.is_zero_approx():
+		contact_direction = opponent_source - center
+		used_opponent_source = true
+	var facing_direction := Vector2(states[actor_id].facing).normalized()
+	var normalized_contact := contact_direction.normalized()
+	var alignment := facing_direction.dot(normalized_contact)
+	var contact_side: StringName = &"side"
+	var score := 1
+	if normalized_contact.is_zero_approx() or alignment > 0.5:
+		contact_side = &"front"
+		score = 2
+	elif alignment < -0.5:
+		contact_side = &"back"
+		score = 0
+	return {
+		"side": contact_side,
+		"score": score,
+		"facing": states[actor_id].facing,
+		"source": source,
+		"contact_direction": contact_direction,
+		"used_opponent_source": used_opponent_source,
+	}
+
+
 static func _state_signature(
 	current_positions: Dictionary,
 	states: Dictionary,
@@ -450,7 +527,7 @@ static func _state_signature(
 			actor_id,
 			current_positions[actor_id],
 			states[actor_id].health,
-			last_sources[actor_id],
+			"%s:%s" % [last_sources[actor_id], states[actor_id].facing],
 		])
 	return "|".join(parts)
 

@@ -1,7 +1,14 @@
 extends RefCounted
 
 
-static func resolve_round(first_squad, second_squad, rng: RandomNumberGenerator) -> Dictionary:
+static func resolve_round(
+	first_squad,
+	second_squad,
+	rng: RandomNumberGenerator,
+	first_advantage: int = 0,
+	second_advantage: int = 0,
+	engagement: Dictionary = {}
+) -> Dictionary:
 	var result := {
 		"first_squad_id": first_squad.actor_id,
 		"second_squad_id": second_squad.actor_id,
@@ -10,18 +17,65 @@ static func resolve_round(first_squad, second_squad, rng: RandomNumberGenerator)
 		"events": [],
 		"action_order": [],
 		"turn_schedule": [],
+		"combat_phases": [],
+		"round_zero_selected": {},
+		"first_advantage": maxi(first_advantage, 0),
+		"second_advantage": maxi(second_advantage, 0),
+		"engagement": engagement.duplicate(true),
 		"first_alive_before": first_squad.living_unit_count(),
 		"second_alive_before": second_squad.living_unit_count(),
 		"formations_before": formation_snapshot(first_squad, second_squad),
 	}
-	var turns := _build_turn_order(first_squad, second_squad)
-	for schedule_index in turns.size():
-		var turn: Dictionary = turns[schedule_index]
+
+	var round_zero_turns := _build_round_zero_order(
+		first_squad, second_squad, first_advantage, second_advantage, rng
+	)
+	if not round_zero_turns.is_empty():
+		result["round_zero_selected"] = _selected_unit_ids(round_zero_turns)
+		_resolve_turns(result, round_zero_turns, &"round_zero", first_squad, second_squad, rng)
+
+	if first_squad.is_alive() and second_squad.is_alive():
+		_resolve_turns(
+			result,
+			_build_turn_order(first_squad, second_squad),
+			&"round_one",
+			first_squad,
+			second_squad,
+			rng
+		)
+	else:
+		result["round_one_cancelled"] = true
+
+	first_squad.sync_summary_stats()
+	second_squad.sync_summary_stats()
+	result["first_alive_after"] = first_squad.living_unit_count()
+	result["second_alive_after"] = second_squad.living_unit_count()
+	result["first_eliminated"] = not first_squad.is_alive()
+	result["second_eliminated"] = not second_squad.is_alive()
+	result["formations_after"] = formation_snapshot(first_squad, second_squad)
+	return result
+
+
+static func _resolve_turns(
+	result: Dictionary,
+	turns: Array,
+	phase: StringName,
+	first_squad,
+	second_squad,
+	rng: RandomNumberGenerator
+) -> void:
+	var schedule_start: int = result["turn_schedule"].size()
+	var event_start: int = result["events"].size()
+	for phase_index in turns.size():
+		var turn: Dictionary = turns[phase_index]
 		var acting_squad = first_squad if turn["squad_id"] == first_squad.actor_id else second_squad
 		var defending_squad = second_squad if acting_squad == first_squad else first_squad
 		var attacker = acting_squad.unit_by_id(turn["unit_id"])
 		var schedule_entry := turn.duplicate(true)
+		var schedule_index: int = result["turn_schedule"].size()
 		schedule_entry["schedule_index"] = schedule_index
+		schedule_entry["phase"] = phase
+		schedule_entry["phase_index"] = phase_index
 		schedule_entry["status"] = &"pending"
 		schedule_entry["skipped_reason"] = &""
 		schedule_entry["event_index"] = -1
@@ -50,6 +104,8 @@ static func resolve_round(first_squad, second_squad, rng: RandomNumberGenerator)
 		var event_index: int = result["events"].size()
 		var event := {
 			"schedule_index": schedule_index,
+			"phase": phase,
+			"phase_index": phase_index,
 			"attacker_squad_id": acting_squad.actor_id,
 			"defender_squad_id": defending_squad.actor_id,
 			"attacker_unit_id": attacker.unit_id,
@@ -80,15 +136,60 @@ static func resolve_round(first_squad, second_squad, rng: RandomNumberGenerator)
 		schedule_entry["status"] = &"acted"
 		schedule_entry["event_index"] = event_index
 		result["turn_schedule"].append(schedule_entry)
+	result["combat_phases"].append({
+		"phase": phase,
+		"schedule_start": schedule_start,
+		"schedule_count": result["turn_schedule"].size() - schedule_start,
+		"event_start": event_start,
+		"event_count": result["events"].size() - event_start,
+	})
 
-	first_squad.sync_summary_stats()
-	second_squad.sync_summary_stats()
-	result["first_alive_after"] = first_squad.living_unit_count()
-	result["second_alive_after"] = second_squad.living_unit_count()
-	result["first_eliminated"] = not first_squad.is_alive()
-	result["second_eliminated"] = not second_squad.is_alive()
-	result["formations_after"] = formation_snapshot(first_squad, second_squad)
-	return result
+
+static func _build_round_zero_order(
+	first_squad,
+	second_squad,
+	first_advantage: int,
+	second_advantage: int,
+	rng: RandomNumberGenerator
+) -> Array:
+	var turns: Array = []
+	for entry: Array in [
+		[first_squad, maxi(first_advantage, 0)],
+		[second_squad, maxi(second_advantage, 0)],
+	]:
+		var squad = entry[0]
+		var advantage: int = entry[1]
+		if advantage <= 0:
+			continue
+		var candidates: Array = squad.living_units().duplicate()
+		_shuffle_with_rng(candidates, rng)
+		for index in mini(advantage, candidates.size()):
+			var unit = candidates[index]
+			turns.append({
+				"squad_id": squad.actor_id,
+				"unit_id": unit.unit_id,
+				"speed": unit.speed,
+				"is_player": squad.controller == &"player",
+			})
+	return turns
+
+
+static func _shuffle_with_rng(items: Array, rng: RandomNumberGenerator) -> void:
+	for index in range(items.size() - 1, 0, -1):
+		var swap_index := rng.randi_range(0, index)
+		var temporary = items[index]
+		items[index] = items[swap_index]
+		items[swap_index] = temporary
+
+
+static func _selected_unit_ids(turns: Array) -> Dictionary:
+	var selected: Dictionary = {}
+	for turn: Dictionary in turns:
+		var squad_id: StringName = turn["squad_id"]
+		var unit_ids: Array = selected.get(squad_id, [])
+		unit_ids.append(turn["unit_id"])
+		selected[squad_id] = unit_ids
+	return selected
 
 
 static func formation_snapshot(first_squad, second_squad) -> Dictionary:

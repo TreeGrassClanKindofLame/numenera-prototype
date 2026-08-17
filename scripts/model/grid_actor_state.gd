@@ -10,6 +10,7 @@ var health: int
 var max_health: int
 var attack: int
 var units: Array
+var facing: Vector2i
 
 
 func _init(
@@ -20,12 +21,14 @@ func _init(
 	p_health: int = 1,
 	p_max_health: int = 1,
 	p_attack: int = 0,
-	p_units: Array = []
+	p_units: Array = [],
+	p_facing: Vector2i = Vector2i.DOWN
 ) -> void:
 	actor_id = p_actor_id
 	cell = p_cell
 	controller = p_controller
 	faction = p_faction
+	facing = p_facing
 	units = []
 	for source_unit in p_units:
 		units.append(source_unit.clone())
@@ -54,7 +57,8 @@ func clone():
 		health,
 		max_health,
 		attack,
-		units
+		units,
+		facing
 	)
 
 

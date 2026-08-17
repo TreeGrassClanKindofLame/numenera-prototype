@@ -6,7 +6,6 @@ const TurnIntentType = preload("res://scripts/model/turn_intent.gd")
 const GridActorStateType = preload("res://scripts/model/grid_actor_state.gd")
 const SquadUnitStateType = preload("res://scripts/model/squad_unit_state.gd")
 const TurnResolverType = preload("res://scripts/core/turn_resolver.gd")
-const DrunkControllerType = preload("res://scripts/core/drunk_controller.gd")
 const CharacterViewType = preload("res://scripts/ui/character_view.gd")
 const BattleOverlayType = preload("res://scripts/ui/battle_overlay.gd")
 
@@ -26,11 +25,11 @@ const FAILED_MOVE_BUMP_DISTANCE := 10.0
 const COLLISION_STAGING_DISTANCE := 11.0
 const RNG_SEED := 1337
 const UNIT_CLASS_CYCLE := [&"", &"tank", &"warrior", &"archer", &"assassin"]
-const ACTOR_ORDER := [&"player", &"drunk"]
+const ACTOR_ORDER := [&"player", &"dummy"]
 const MAP_ROWS := [
 	"############",
-	"#P.D.#.....#",
-	"#....#.....#",
+	"#P...#.....#",
+	"#..T.#.....#",
 	"#....#.....#",
 	"#..........#",
 	"#..###.....#",
@@ -47,14 +46,13 @@ const COLOR_PANEL := Color("182231")
 const COLOR_TEXT := Color("e8edf4")
 const COLOR_MUTED := Color("9eabbc")
 const COLOR_PLAYER := Color("4da3ff")
-const COLOR_DRUNK := Color("f19a4b")
+const COLOR_DUMMY := Color("c79a62")
 
 var _blocked: Dictionary = {}
 var _actors: Dictionary = {}
 var _actor_views: Dictionary = {}
 var _turn_number := 1
 var _busy := false
-var _drunk_controller = DrunkControllerType.new(RNG_SEED)
 
 var _turn_label: Label
 var _status_label: Label
@@ -119,11 +117,8 @@ func _play_turn(player_intent) -> void:
 	_update_interface("正在结算第 %d 回合…" % _turn_number, _log_label.text)
 
 	var intents: Dictionary = {&"player": player_intent}
-	if _actors.has(&"drunk"):
-		intents[&"drunk"] = _drunk_controller.choose_pursuit_intent(
-			&"drunk", _actors[&"drunk"].cell, _actors[&"player"].cell,
-			_blocked, BOARD_SIZE
-		)
+	if _actors.has(&"dummy"):
+		intents[&"dummy"] = _wait_intent(&"dummy")
 
 	var actor_states: Array = []
 	for actor_id: StringName in _active_actor_ids():
@@ -148,6 +143,7 @@ func _play_turn(player_intent) -> void:
 		var view = _actor_views[actor_id]
 		view.position = _cell_to_world(actor.cell)
 		view.set_squad_stats(actor.health, actor.max_health, actor.attack, actor.living_unit_count())
+		view.set_facing(actor.facing)
 		view.reset_visual_state()
 
 	_turn_number += 1
@@ -163,6 +159,11 @@ func _play_resolution_animation(
 	intents: Dictionary,
 	resolution
 ) -> void:
+	for actor_id: StringName in resolution.movement_results:
+		if _actor_views.has(actor_id):
+			_actor_views[actor_id].set_facing(
+				resolution.movement_results[actor_id].get("facing", Vector2i.DOWN)
+			)
 	var collision_stages := _build_collision_stages(resolution)
 	var approach := create_tween()
 	approach.tween_method(
@@ -434,9 +435,9 @@ func _parse_map() -> void:
 					_actors[&"player"] = GridActorStateType.new(
 						&"player", cell, &"player", &"player", 5, 5, 2
 					)
-				"D":
-					_actors[&"drunk"] = _make_default_squad(
-						&"drunk", cell, &"npc", &"drunk"
+				"T":
+					_actors[&"dummy"] = _make_default_squad(
+						&"dummy", cell, &"npc", &"dummy"
 					)
 	if _actors.has(&"player"):
 		var player_cell: Vector2i = _actors[&"player"].cell
@@ -457,19 +458,30 @@ func _make_default_squad(
 		[&"archer", Vector2i(1, 1)],
 		[&"assassin", Vector2i(2, 1)],
 	]
-	if actor_id == &"drunk":
-		unit_specs = [
-			[&"warrior", Vector2i(0, 0)],
-			[&"tank", Vector2i(2, 0)],
-			[&"assassin", Vector2i(0, 1)],
-			[&"archer", Vector2i(2, 1)],
-		]
 	var units: Array = []
+	if actor_id == &"dummy":
+		unit_specs = [
+			[&"custom", Vector2i(0, 0)],
+			[&"custom", Vector2i(1, 0)],
+			[&"custom", Vector2i(2, 0)],
+			[&"custom", Vector2i(1, 1)],
+		]
 	for index in unit_specs.size():
 		var spec: Array = unit_specs[index]
-		units.append(SquadUnitStateType.create_for_class(
-			StringName("%s_%d" % [actor_id, index]), spec[0], spec[1]
-		))
+		if actor_id == &"dummy":
+			units.append(SquadUnitStateType.new(
+				StringName("%s_%d" % [actor_id, index]),
+				SquadUnitStateType.CLASS_CUSTOM,
+				spec[1],
+				50,
+				50,
+				0,
+				1
+			))
+		else:
+			units.append(SquadUnitStateType.create_for_class(
+				StringName("%s_%d" % [actor_id, index]), spec[0], spec[1]
+			))
 	return GridActorStateType.new(actor_id, cell, controller, faction, 1, 1, 1, units)
 
 
@@ -511,12 +523,13 @@ func _build_actor_views() -> void:
 		var view = CharacterViewType.new()
 		view.name = String(actor_id).capitalize()
 		view.setup(
-			COLOR_PLAYER if actor_id == &"player" else COLOR_DRUNK,
+			COLOR_PLAYER if actor_id == &"player" else COLOR_DUMMY,
 			actor.health,
 			actor.max_health,
 			actor.attack
 		)
 		view.set_squad_stats(actor.health, actor.max_health, actor.attack, actor.living_unit_count())
+		view.set_facing(actor.facing)
 		view.position = _cell_to_world(actor.cell)
 		_actor_views[actor_id] = view
 		add_child(view)
@@ -570,10 +583,10 @@ func _build_formation_panel() -> void:
 	select_player.pressed.connect(_select_formation_squad.bind(&"player"))
 	add_child(select_player)
 	var select_enemy := Button.new()
-	select_enemy.text = "酒鬼小队"
+	select_enemy.text = "木桩小队"
 	select_enemy.position = Vector2(802.0, 274.0)
 	select_enemy.size = Vector2(150.0, 30.0)
-	select_enemy.pressed.connect(_select_formation_squad.bind(&"drunk"))
+	select_enemy.pressed.connect(_select_formation_squad.bind(&"dummy"))
 	add_child(select_enemy)
 	for row in 2:
 		for column in 3:
@@ -625,8 +638,9 @@ func _refresh_formation_panel() -> void:
 		if unit == null:
 			button.text = "%s%d｜空" % [row_name, slot.x + 1]
 		else:
+			var unit_name: String = "木桩" if _selected_squad_id == &"dummy" and unit.unit_class == SquadUnitStateType.CLASS_CUSTOM else unit.class_name_zh()
 			button.text = "%s%d｜%s\nHP%d 攻%d 速%d" % [
-				row_name, slot.x + 1, unit.class_name_zh(),
+				row_name, slot.x + 1, unit_name,
 				maxi(unit.health, 0), unit.attack, unit.speed,
 			]
 
@@ -666,11 +680,38 @@ func _format_turn_log(turn_index: int, intents: Dictionary, resolution) -> Strin
 				var cell: Vector2i = group["cell"]
 				location_text = "网格(%d,%d)" % [cell.x, cell.y]
 			lines.append("第 %d 波｜%s" % [wave_number, location_text])
+			for encounter: Dictionary in group.get("encounters", []):
+				if encounter.get("skipped", false):
+					continue
+				var engagement: Dictionary = encounter.get("engagement", {})
+				if engagement.is_empty():
+					continue
+				var first_contact: Dictionary = engagement.get("first_contact", {})
+				var second_contact: Dictionary = engagement.get("second_contact", {})
+				var advantage_text := "均无优势"
+				if encounter.get("first_advantage", 0) > 0:
+					advantage_text = "%s优势%d" % [
+						_actor_name(encounter["first_squad_id"]),
+						encounter["first_advantage"],
+					]
+				elif encounter.get("second_advantage", 0) > 0:
+					advantage_text = "%s优势%d" % [
+						_actor_name(encounter["second_squad_id"]),
+						encounter["second_advantage"],
+					]
+				lines.append("  接敌：%s%d vs %s%d → %s" % [
+					_contact_side_text(first_contact.get("side", &"front")),
+					first_contact.get("score", 2),
+					_contact_side_text(second_contact.get("side", &"front")),
+					second_contact.get("score", 2),
+					advantage_text,
+				])
 			if group["combat_events"].is_empty():
 				lines.append("  同阵营：跳过战斗")
 			for event: Dictionary in group["combat_events"]:
 				lines.append(
-					"  %s/%s → %s/%s  %d→%d%s" % [
+					"  %s｜%s/%s → %s/%s  %d→%d%s" % [
+						"第零回合" if event.get("phase", &"round_one") == &"round_zero" else "第一回合",
 						_actor_name(event["attacker_squad_id"]),
 						String(event["attacker_unit_id"]),
 						_actor_name(event["defender_squad_id"]),
@@ -697,12 +738,20 @@ func _format_turn_log(turn_index: int, intents: Dictionary, resolution) -> Strin
 	return "\n".join(lines)
 
 
+func _contact_side_text(side: StringName) -> String:
+	match side:
+		&"front": return "正面"
+		&"side": return "侧面"
+		&"back": return "背面"
+	return "未知"
+
+
 func _actor_name(actor_id: StringName) -> String:
 	match actor_id:
 		&"player":
 			return "主角"
-		&"drunk":
-			return "酒鬼"
+		&"dummy":
+			return "木桩"
 	return String(actor_id)
 
 

@@ -28,6 +28,10 @@ func _run_all() -> void:
 	_test_target_rule_metadata()
 	_test_later_unit_retargets_current_battlefield()
 	_test_single_attack_has_no_counterattack()
+	_test_facing_updates_from_move_intent()
+	_test_contact_scores_and_advantage_difference()
+	_test_return_collision_keeps_facing_and_scores_again()
+	_test_round_zero_selection_and_extra_actions()
 	_test_map_move_wait_wall_and_chain()
 	_test_head_on_squad_battle_returns_survivors()
 	_test_sole_squad_survivor_takes_collision_cell()
@@ -39,11 +43,17 @@ func _run_all() -> void:
 	await _test_main_scene_gm_panel_and_combat()
 	await _test_focused_stage_auto_playback()
 	await _test_slow_motion_requires_one_step_per_action()
+	# Let queued scene/audio frees reach the ObjectDB before the command-line
+	# runner exits; otherwise the fast Compatibility run reports transient leaks.
+	await get_tree().process_frame
+	await get_tree().create_timer(0.15).timeout
 
 	if _failures == 0:
-		print("PASS: %d checks across 22 squad-combat scenarios." % _checks)
+		print("PASS: %d checks across 26 squad-combat scenarios." % _checks)
+		get_tree().quit(0)
 	else:
 		push_error("FAIL: %d of %d checks failed." % [_failures, _checks])
+		get_tree().quit(1)
 
 
 func _test_class_stats_and_free_formation() -> void:
@@ -253,6 +263,130 @@ func _test_single_attack_has_no_counterattack() -> void:
 	_expect_equal(result["events"].size(), 2, "each living unit attacks at most once")
 
 
+func _test_facing_updates_from_move_intent() -> void:
+	var actor = _squad(&"actor", &"player", &"player", Vector2i(1, 1), [
+		_unit(&"u", &"warrior", 1, 0, 10, 1, 1),
+	])
+	var bumped = _resolve(
+		Vector2i(4, 4), [Vector2i(0, 1)], [actor],
+		{&"actor": _move(&"actor", Vector2i.LEFT)}
+	)
+	_expect_equal(bumped.actor_state_for(&"actor").cell, Vector2i(1, 1), "wall bump does not move squad")
+	_expect_equal(bumped.actor_state_for(&"actor").facing, Vector2i.LEFT, "wall bump still turns squad")
+	var waited = _resolve(
+		Vector2i(4, 4), [], [bumped.actor_state_for(&"actor")],
+		{&"actor": _wait(&"actor")}
+	)
+	_expect_equal(waited.actor_state_for(&"actor").facing, Vector2i.LEFT, "wait preserves facing")
+	var edge_actor = _squad(&"edge", &"player", &"player", Vector2i.ZERO, [
+		_unit(&"edge_u", &"warrior", 1, 0, 10, 1, 1),
+	])
+	var out_of_bounds = _resolve(
+		Vector2i(4, 4), [], [edge_actor],
+		{&"edge": _move(&"edge", Vector2i.UP)}
+	)
+	_expect_equal(out_of_bounds.actor_state_for(&"edge").facing, Vector2i.UP, "out-of-bounds move still turns squad")
+
+
+func _test_contact_scores_and_advantage_difference() -> void:
+	var cases := [
+		[Vector2i.DOWN, &"front", 2, 0],
+		[Vector2i.RIGHT, &"side", 1, 1],
+		[Vector2i.UP, &"back", 0, 2],
+	]
+	for case_data: Array in cases:
+		var mover = _squad(&"mover", &"mover", &"player", Vector2i(1, 2), [
+			_unit(&"m", &"warrior", 1, 0, 20, 1, 1),
+		], Vector2i.DOWN)
+		var defender = _squad(&"defender", &"defender", &"npc", Vector2i(1, 1), [
+			_unit(&"d", &"tank", 1, 0, 20, 1, 1),
+		], case_data[0])
+		var resolution = _resolve(
+			Vector2i(4, 4), [], [mover, defender],
+			{&"mover": _move(&"mover", Vector2i.UP), &"defender": _wait(&"defender")},
+			700 + case_data[2]
+		)
+		var encounter: Dictionary = resolution.collision_waves[0]["groups"][0]["encounters"][0]
+		var engagement: Dictionary = encounter["engagement"]
+		_expect_equal(engagement["first_contact"]["side"], &"front", "moving squad presents its front")
+		_expect_equal(engagement["first_score"], 2, "moving front scores two")
+		_expect_equal(engagement["second_contact"]["side"], case_data[1], "waiting squad contact side is classified")
+		_expect_equal(engagement["second_score"], case_data[2], "waiting squad contact score matches side")
+		_expect_equal(encounter["first_advantage"], case_data[3], "higher score receives only the score difference")
+
+
+func _test_return_collision_keeps_facing_and_scores_again() -> void:
+	var a = _squad(&"a", &"a", &"npc", Vector2i(1, 0), [
+		_unit(&"a_u", &"tank", 1, 0, 30, 1, 1),
+	], Vector2i.DOWN)
+	var b = _squad(&"b", &"b", &"npc", Vector2i(1, 1), [
+		_unit(&"b_u", &"tank", 1, 0, 30, 1, 1),
+	], Vector2i.DOWN)
+	var c = _squad(&"c", &"c", &"npc", Vector2i(1, 2), [
+		_unit(&"c_u", &"tank", 1, 0, 30, 1, 1),
+	], Vector2i.DOWN)
+	var resolution = _resolve(
+		Vector2i(3, 4), [], [a, b, c], {
+			&"a": _wait(&"a"),
+			&"b": _move(&"b", Vector2i.UP),
+			&"c": _move(&"c", Vector2i.UP),
+		}, 812
+	)
+	_expect_equal(resolution.collision_waves.size(), 2, "combat return creates a second collision wave")
+	var second_encounter: Dictionary = resolution.collision_waves[1]["groups"][0]["encounters"][0]
+	var engagement: Dictionary = second_encounter["engagement"]
+	_expect_equal(engagement["first_contact"]["side"], &"back", "returning B keeps facing up and enters backward")
+	_expect_equal(engagement["first_score"], 0, "backward return scores zero")
+	_expect_equal(engagement["second_contact"]["side"], &"front", "C enters the return collision from its front")
+	_expect_equal(second_encounter["second_advantage"], 2, "C gains two advantage from front versus back")
+
+
+func _test_round_zero_selection_and_extra_actions() -> void:
+	var first = _squad(&"player", &"player", &"player", Vector2i.ZERO, [
+		_unit(&"p0", &"tank", 0, 0, 20, 1, 1),
+		_unit(&"p1", &"warrior", 1, 0, 20, 1, 2),
+		_unit(&"p2", &"archer", 2, 0, 20, 1, 2),
+		_unit(&"p3", &"assassin", 1, 1, 20, 1, 3),
+	])
+	var second = _squad(&"enemy", &"enemy", &"npc", Vector2i.ZERO, [
+		_unit(&"enemy_u", &"tank", 1, 0, 50, 1, 1),
+	])
+	var result := _battle(first, second, 901, 2, 0)
+	var selected: Array = result["round_zero_selected"][&"player"]
+	_expect_equal(selected.size(), 2, "two advantage selects two units")
+	_expect_true(selected[0] != selected[1], "round-zero selection has no duplicates")
+	_expect_equal(result["turn_schedule"][0]["phase"], &"round_zero", "round zero is scheduled first")
+	_expect_equal(result["turn_schedule"][1]["phase"], &"round_zero", "both advantage actions are in round zero")
+	for unit_id: StringName in selected:
+		var normal_action_found := false
+		for entry: Dictionary in result["turn_schedule"]:
+			if entry["phase"] == &"round_one" and entry["unit_id"] == unit_id:
+				normal_action_found = true
+		_expect_true(normal_action_found, "round-zero unit can act again in round one")
+	var repeat_first = _squad(&"player", &"player", &"player", Vector2i.ZERO, [
+		_unit(&"p0", &"tank", 0, 0, 20, 1, 1),
+		_unit(&"p1", &"warrior", 1, 0, 20, 1, 2),
+		_unit(&"p2", &"archer", 2, 0, 20, 1, 2),
+		_unit(&"p3", &"assassin", 1, 1, 20, 1, 3),
+	])
+	var repeat_second = _squad(&"enemy", &"enemy", &"npc", Vector2i.ZERO, [
+		_unit(&"enemy_u", &"tank", 1, 0, 50, 1, 1),
+	])
+	var repeated := _battle(repeat_first, repeat_second, 901, 2, 0)
+	_expect_equal(repeated["round_zero_selected"][&"player"], selected, "same seed reproduces round-zero selection and order")
+	var finishers = _squad(&"finishers", &"finishers", &"player", Vector2i.ZERO, [
+		_unit(&"f0", &"warrior", 0, 0, 10, 2, 2),
+		_unit(&"f1", &"warrior", 1, 0, 10, 2, 2),
+	])
+	var fragile = _squad(&"fragile", &"fragile", &"npc", Vector2i.ZERO, [
+		_unit(&"fragile_u", &"custom", 1, 0, 1, 1, 1),
+	])
+	var lethal_zero := _battle(finishers, fragile, 902, 2, 0)
+	_expect_true(lethal_zero.get("round_one_cancelled", false), "round one is cancelled when round zero eliminates a squad")
+	_expect_equal(lethal_zero["turn_schedule"].size(), 2, "remaining selected round-zero unit is retained as a skipped schedule entry")
+	_expect_equal(lethal_zero["turn_schedule"][1]["skipped_reason"], &"no_living_enemy", "remaining round-zero action skips after elimination")
+
+
 func _test_map_move_wait_wall_and_chain() -> void:
 	var states := [
 		_squad(&"a", &"neutral", &"npc", Vector2i(1, 1), [_unit(&"a1", &"custom", 1, 0, 5, 1, 1)]),
@@ -353,16 +487,21 @@ func _test_main_scene_gm_panel_and_combat() -> void:
 	add_child(main)
 	await get_tree().process_frame
 	_expect_equal(main._actors[&"player"].living_unit_count(), 4, "main scene player starts with four-unit squad")
-	_expect_equal(main._actors[&"drunk"].living_unit_count(), 4, "main scene enemy exposes full four-unit formation")
+	_expect_equal(main._actors[&"dummy"].living_unit_count(), 4, "main scene dummy exposes full four-unit formation")
+	_expect_equal(main._actors[&"dummy"].attack, 0, "dummy squad cannot damage the player")
+	_expect_equal(main._actors[&"dummy"].health, 200, "dummy squad has durable test health")
 	_expect_equal(main._formation_labels.size(), 6, "GM panel exposes all 2x3 slots")
 	main._selected_squad_id = &"player"
 	var original_class: StringName = main._actors[&"player"].unit_at(Vector2i(0, 0)).unit_class
 	main._cycle_formation_slot(Vector2i(0, 0))
 	_expect_true(main._actors[&"player"].unit_at(Vector2i(0, 0)).unit_class != original_class, "GM slot cycles class before movement")
 	_expect_true(main._formation_labels[Vector2i(0, 0)].text.contains("HP"), "GM panel shows full unit attributes")
-	main._drunk_controller = FixedController.new(_move(&"drunk", Vector2i.LEFT))
+	await main._play_turn(_move(&"player", Vector2i.RIGHT))
+	await main._play_turn(_move(&"player", Vector2i.DOWN))
 	await main._play_turn(_move(&"player", Vector2i.RIGHT))
 	_expect_true(main._log_label.text.contains("player_"), "integrated combat log records unit attacker")
+	_expect_equal(main._actors[&"dummy"].cell, Vector2i(3, 2), "dummy waits at its open test cell")
+	_expect_equal(main._actors[&"dummy"].facing, Vector2i.DOWN, "dummy keeps its initial downward facing")
 	_expect_true(not main._battle_overlay.visible, "battle overlay closes after complete presentation")
 	_expect_true(not main._busy, "input unlocks after squad battle animation")
 	var preview := get_viewport().get_texture().get_image()
@@ -413,19 +552,23 @@ func _test_slow_motion_requires_one_step_per_action() -> void:
 	var first = _squad(&"player", &"player", &"player", Vector2i.ZERO, [
 		_unit(&"p", &"warrior", 1, 0, 5, 2, 2),
 	])
-	var second = _squad(&"drunk", &"drunk", &"npc", Vector2i.ZERO, [
+	var second = _squad(&"dummy", &"dummy", &"npc", Vector2i.ZERO, [
 		_unit(&"d", &"tank", 1, 0, 8, 1, 1),
 	])
-	var encounter := _battle(first, second, 62)
+	var encounter := _battle(first, second, 62, 1, 0)
 	main._play_squad_encounter(encounter, {
 		"wave_index": 0, "group_index": 0, "group_count": 1,
 		"pair_index": 0, "pair_count": 1,
 	})
 	await get_tree().process_frame
 	_expect_true(main._waiting_for_combat_step, "slow battle pauses before first action resolves")
+	_expect_true(main._battle_overlay.detail_text.contains("第零回合"), "slow battle identifies the round-zero action")
 	main._advance_slow_battle()
 	await get_tree().create_timer(main.COMBAT_EVENT_DURATION * 1.2).timeout
-	_expect_true(main._waiting_for_combat_step, "next unit action pauses again")
+	_expect_true(main._waiting_for_combat_step, "round one pauses after the round-zero action")
+	main._advance_slow_battle()
+	await get_tree().create_timer(main.COMBAT_EVENT_DURATION * 1.2).timeout
+	_expect_true(main._waiting_for_combat_step, "next normal unit action pauses again")
 	main._advance_slow_battle()
 	await get_tree().create_timer(main.COMBAT_EVENT_DURATION * 1.2).timeout
 	_expect_true(main._waiting_for_combat_step, "slow battle pauses again on result confirmation")
@@ -438,25 +581,25 @@ func _test_slow_motion_requires_one_step_per_action() -> void:
 	await get_tree().process_frame
 
 
-class FixedController:
-	extends RefCounted
-	var fixed_intent
-	func _init(p_intent) -> void: fixed_intent = p_intent
-	func choose_pursuit_intent(_a, _b, _c, _d, _e): return fixed_intent
-
-
 func _unit(id: StringName, unit_class: StringName, column: int, row: int, hp: int, atk: int, speed: int):
 	return SquadUnitStateType.new(id, unit_class, Vector2i(column, row), hp, hp, atk, speed)
 
 
-func _squad(id: StringName, faction: StringName, controller: StringName, cell: Vector2i, units: Array):
-	return GridActorStateType.new(id, cell, controller, faction, 1, 1, 1, units)
+func _squad(
+	id: StringName,
+	faction: StringName,
+	controller: StringName,
+	cell: Vector2i,
+	units: Array,
+	facing: Vector2i = Vector2i.DOWN
+):
+	return GridActorStateType.new(id, cell, controller, faction, 1, 1, 1, units, facing)
 
 
-func _battle(first, second, battle_seed: int) -> Dictionary:
+func _battle(first, second, battle_seed: int, first_advantage: int = 0, second_advantage: int = 0) -> Dictionary:
 	var rng := RandomNumberGenerator.new()
 	rng.seed = battle_seed
-	return SquadBattleResolverType.resolve_round(first, second, rng)
+	return SquadBattleResolverType.resolve_round(first, second, rng, first_advantage, second_advantage)
 
 
 func _resolve(board_size: Vector2i, walls: Array, states: Array, intents: Dictionary, battle_seed: int = 1337):
