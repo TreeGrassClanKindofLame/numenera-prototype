@@ -449,6 +449,8 @@ func _squad_display_name(squad_id: StringName) -> String:
 	match squad_id:
 		&"player": return "主角小队"
 		&"dummy": return "木桩小队"
+		&"robot": return "机器人小队"
+		&"bandit": return "强盗小队"
 	return String(squad_id)
 
 

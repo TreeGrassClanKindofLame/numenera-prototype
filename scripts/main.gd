@@ -6,6 +6,9 @@ const TurnIntentType = preload("res://scripts/model/turn_intent.gd")
 const GridActorStateType = preload("res://scripts/model/grid_actor_state.gd")
 const SquadUnitStateType = preload("res://scripts/model/squad_unit_state.gd")
 const TurnResolverType = preload("res://scripts/core/turn_resolver.gd")
+const EnemyAIControllerType = preload("res://scripts/core/enemy_ai_controller.gd")
+const EnemyBrainStateType = preload("res://scripts/model/enemy_brain_state.gd")
+const ScenarioCatalogType = preload("res://scripts/core/test_scenario_catalog.gd")
 const CharacterViewType = preload("res://scripts/ui/character_view.gd")
 const BattleOverlayType = preload("res://scripts/ui/battle_overlay.gd")
 
@@ -25,17 +28,6 @@ const FAILED_MOVE_BUMP_DISTANCE := 10.0
 const COLLISION_STAGING_DISTANCE := 11.0
 const RNG_SEED := 1337
 const UNIT_CLASS_CYCLE := [&"", &"tank", &"warrior", &"archer", &"assassin"]
-const ACTOR_ORDER := [&"player", &"dummy"]
-const MAP_ROWS := [
-	"############",
-	"#P...#.....#",
-	"#..T.#.....#",
-	"#....#.....#",
-	"#..........#",
-	"#..###.....#",
-	"#..........#",
-	"############",
-]
 
 const COLOR_BACKGROUND := Color("111722")
 const COLOR_FLOOR_A := Color("202b3a")
@@ -47,10 +39,19 @@ const COLOR_TEXT := Color("e8edf4")
 const COLOR_MUTED := Color("9eabbc")
 const COLOR_PLAYER := Color("4da3ff")
 const COLOR_DUMMY := Color("c79a62")
+const COLOR_ROBOT := Color("7d8fe8")
+const COLOR_BANDIT := Color("e16f5b")
+const COLOR_VISION := Color(0.95, 0.72, 0.22, 0.20)
+const COLOR_ALERT_VISION := Color(0.95, 0.25, 0.20, 0.24)
+const COLOR_PATROL := Color(0.48, 0.58, 0.96, 0.24)
 
 var _blocked: Dictionary = {}
 var _actors: Dictionary = {}
 var _actor_views: Dictionary = {}
+var _enemy_brains: Dictionary = {}
+var _enemy_ai = EnemyAIControllerType.new()
+var _scenario_id: StringName = ScenarioCatalogType.SCENARIO_DUMMY
+var _scenario: Dictionary = {}
 var _turn_number := 1
 var _busy := false
 
@@ -63,9 +64,14 @@ var _battle_overlay
 var _battle_slow_motion_enabled := false
 var _waiting_for_combat_step := false
 var _slow_motion_toggle: CheckButton
+var _ai_debug_toggle: CheckButton
+var _scenario_buttons: Dictionary = {}
+var _squad_selector_ids: Array = []
+var _squad_selector_buttons: Array = []
 
 
 func _ready() -> void:
+	_scenario = ScenarioCatalogType.definition(_scenario_id)
 	_parse_map()
 	_ensure_input_actions()
 	_build_actor_views()
@@ -73,6 +79,7 @@ func _ready() -> void:
 	_battle_overlay = BattleOverlayType.new()
 	add_child(_battle_overlay)
 	_battle_overlay.setup()
+	_refresh_scenario_controls()
 	_update_interface("等待玩家输入", "尚未结算。")
 	queue_redraw()
 
@@ -114,11 +121,20 @@ func _play_turn(player_intent) -> void:
 		return
 	_busy = true
 	_set_slow_motion_toggle_locked(true)
+	_set_scenario_controls_locked(true)
 	_update_interface("正在结算第 %d 回合…" % _turn_number, _log_label.text)
 
 	var intents: Dictionary = {&"player": player_intent}
-	if _actors.has(&"dummy"):
-		intents[&"dummy"] = _wait_intent(&"dummy")
+	for actor_id: StringName in _enemy_brains:
+		if not _actors.has(actor_id):
+			continue
+		intents[actor_id] = _enemy_ai.choose_intent(
+			_enemy_brains[actor_id],
+			_actors[actor_id],
+			_actors.get(&"player"),
+			_blocked,
+			BOARD_SIZE
+		)
 
 	var actor_states: Array = []
 	for actor_id: StringName in _active_actor_ids():
@@ -130,6 +146,13 @@ func _play_turn(player_intent) -> void:
 	var resolution = TurnResolverType.resolve(
 		BOARD_SIZE, _blocked, actor_states, intents, RNG_SEED + resolved_turn
 	)
+	for actor_id: StringName in _enemy_brains.keys():
+		if not _enemy_brains.has(actor_id):
+			continue
+		var events := _enemy_ai.commit_after_turn(
+			_enemy_brains[actor_id], resolution, _blocked, BOARD_SIZE
+		)
+		resolution.enemy_events.append_array(events)
 	var turn_log := _format_turn_log(resolved_turn, intents, resolution)
 	var animation_starts: Dictionary = {}
 	for actor_id: StringName in _active_actor_ids():
@@ -137,6 +160,9 @@ func _play_turn(player_intent) -> void:
 
 	await _play_resolution_animation(animation_starts, intents, resolution)
 	_actors = resolution.final_actor_states.duplicate()
+	for actor_id: StringName in _enemy_brains.keys():
+		if not _actors.has(actor_id):
+			_enemy_brains.erase(actor_id)
 
 	for actor_id: StringName in _active_actor_ids():
 		var actor = _actors[actor_id]
@@ -149,9 +175,11 @@ func _play_turn(player_intent) -> void:
 	_turn_number += 1
 	_busy = false
 	_set_slow_motion_toggle_locked(false)
+	_set_scenario_controls_locked(false)
 	var status := "等待玩家输入" if _actors.has(&"player") else "主角已死亡，原型结束"
 	_update_interface(status, turn_log)
 	_refresh_formation_panel()
+	queue_redraw()
 
 
 func _play_resolution_animation(
@@ -423,8 +451,10 @@ func _play_wave_settle(wave: Dictionary, next_wave: Dictionary) -> void:
 func _parse_map() -> void:
 	_blocked.clear()
 	_actors.clear()
+	_enemy_brains.clear()
+	var map_rows: Array = _scenario.get("map_rows", [])
 	for y in BOARD_SIZE.y:
-		var row: String = MAP_ROWS[y]
+		var row: String = map_rows[y]
 		for x in BOARD_SIZE.x:
 			var marker := row.substr(x, 1)
 			var cell := Vector2i(x, y)
@@ -437,12 +467,33 @@ func _parse_map() -> void:
 					)
 				"T":
 					_actors[&"dummy"] = _make_default_squad(
-						&"dummy", cell, &"npc", &"dummy"
+						&"dummy", cell, &"npc", &"dummy", Vector2i.DOWN
+					)
+					_enemy_brains[&"dummy"] = EnemyBrainStateType.new(
+						&"dummy", EnemyBrainStateType.BEHAVIOR_DUMMY
+					)
+				"R":
+					var robot_facing: Vector2i = _scenario.get("enemy_facing", Vector2i.RIGHT)
+					_actors[&"robot"] = _make_default_squad(
+						&"robot", cell, &"npc", &"robot", robot_facing
+					)
+					_enemy_brains[&"robot"] = EnemyBrainStateType.new(
+						&"robot",
+						EnemyBrainStateType.BEHAVIOR_ROBOT,
+						_scenario.get("patrol_path", [])
+					)
+				"B":
+					var bandit_facing: Vector2i = _scenario.get("enemy_facing", Vector2i.LEFT)
+					_actors[&"bandit"] = _make_default_squad(
+						&"bandit", cell, &"npc", &"bandit", bandit_facing
+					)
+					_enemy_brains[&"bandit"] = EnemyBrainStateType.new(
+						&"bandit", EnemyBrainStateType.BEHAVIOR_BANDIT
 					)
 	if _actors.has(&"player"):
 		var player_cell: Vector2i = _actors[&"player"].cell
 		_actors[&"player"] = _make_default_squad(
-			&"player", player_cell, &"player", &"player"
+			&"player", player_cell, &"player", &"player", Vector2i.DOWN
 		)
 
 
@@ -450,7 +501,8 @@ func _make_default_squad(
 	actor_id: StringName,
 	cell: Vector2i,
 	controller: StringName,
-	faction: StringName
+	faction: StringName,
+	facing: Vector2i = Vector2i.DOWN
 ):
 	var unit_specs := [
 		[&"tank", Vector2i(0, 0)],
@@ -465,6 +517,20 @@ func _make_default_squad(
 			[&"custom", Vector2i(1, 0)],
 			[&"custom", Vector2i(2, 0)],
 			[&"custom", Vector2i(1, 1)],
+		]
+	elif actor_id == &"robot":
+		unit_specs = [
+			[&"tank", Vector2i(0, 0)],
+			[&"tank", Vector2i(2, 0)],
+			[&"archer", Vector2i(0, 1)],
+			[&"archer", Vector2i(2, 1)],
+		]
+	elif actor_id == &"bandit":
+		unit_specs = [
+			[&"warrior", Vector2i(0, 0)],
+			[&"warrior", Vector2i(2, 0)],
+			[&"assassin", Vector2i(0, 1)],
+			[&"assassin", Vector2i(2, 1)],
 		]
 	for index in unit_specs.size():
 		var spec: Array = unit_specs[index]
@@ -482,18 +548,17 @@ func _make_default_squad(
 			units.append(SquadUnitStateType.create_for_class(
 				StringName("%s_%d" % [actor_id, index]), spec[0], spec[1]
 			))
-	return GridActorStateType.new(actor_id, cell, controller, faction, 1, 1, 1, units)
+	return GridActorStateType.new(
+		actor_id, cell, controller, faction, 1, 1, 1, units, facing
+	)
 
 
 func _active_actor_ids() -> Array:
-	var result: Array = []
-	for actor_id: StringName in ACTOR_ORDER:
-		if _actors.has(actor_id):
-			result.append(actor_id)
+	var result: Array = [&"player"] if _actors.has(&"player") else []
 	var remaining := _actors.keys()
 	remaining.sort()
 	for actor_id: StringName in remaining:
-		if not actor_id in result:
+		if actor_id != &"player":
 			result.append(actor_id)
 	return result
 
@@ -523,7 +588,7 @@ func _build_actor_views() -> void:
 		var view = CharacterViewType.new()
 		view.name = String(actor_id).capitalize()
 		view.setup(
-			COLOR_PLAYER if actor_id == &"player" else COLOR_DUMMY,
+			_actor_color(actor_id),
 			actor.health,
 			actor.max_health,
 			actor.attack
@@ -549,6 +614,7 @@ func _build_interface() -> void:
 	add_child(_turn_label)
 	_status_label = _make_label("", Vector2(644.0, 116.0), Vector2(268.0, 24.0), 15, COLOR_MUTED)
 	add_child(_status_label)
+	_build_scenario_controls()
 
 	add_child(_make_label(
 		"操作\nW / A / S / D　移动一格\nR　　　　　　 等待",
@@ -565,6 +631,13 @@ func _build_interface() -> void:
 	_slow_motion_toggle.button_pressed = false
 	_slow_motion_toggle.toggled.connect(_on_slow_motion_toggled)
 	add_child(_slow_motion_toggle)
+	_ai_debug_toggle = CheckButton.new()
+	_ai_debug_toggle.text = "显示AI调试覆盖"
+	_ai_debug_toggle.position = Vector2(960.0, 310.0)
+	_ai_debug_toggle.size = Vector2(208.0, 30.0)
+	_ai_debug_toggle.button_pressed = true
+	_ai_debug_toggle.toggled.connect(_on_ai_debug_toggled)
+	add_child(_ai_debug_toggle)
 	_build_formation_panel()
 	add_child(_make_label(
 		"上一回合",
@@ -576,18 +649,13 @@ func _build_interface() -> void:
 
 
 func _build_formation_panel() -> void:
-	var select_player := Button.new()
-	select_player.text = "主角小队"
-	select_player.position = Vector2(644.0, 274.0)
-	select_player.size = Vector2(150.0, 30.0)
-	select_player.pressed.connect(_select_formation_squad.bind(&"player"))
-	add_child(select_player)
-	var select_enemy := Button.new()
-	select_enemy.text = "木桩小队"
-	select_enemy.position = Vector2(802.0, 274.0)
-	select_enemy.size = Vector2(150.0, 30.0)
-	select_enemy.pressed.connect(_select_formation_squad.bind(&"dummy"))
-	add_child(select_enemy)
+	for index in 2:
+		var selector := Button.new()
+		selector.position = Vector2(644.0 + index * 158.0, 274.0)
+		selector.size = Vector2(150.0, 30.0)
+		selector.pressed.connect(_select_formation_squad_by_index.bind(index))
+		_squad_selector_buttons.append(selector)
+		add_child(selector)
 	for row in 2:
 		for column in 3:
 			var slot := Vector2i(column, row)
@@ -597,7 +665,75 @@ func _build_formation_panel() -> void:
 			button.pressed.connect(_cycle_formation_slot.bind(slot))
 			_formation_labels[slot] = button
 			add_child(button)
+	_refresh_squad_selectors()
 	_refresh_formation_panel()
+
+
+func _build_scenario_controls() -> void:
+	var ids := ScenarioCatalogType.scenario_ids()
+	for index in ids.size():
+		var scenario_id: StringName = ids[index]
+		var button := Button.new()
+		button.text = ScenarioCatalogType.definition(scenario_id)["display_name"].trim_suffix("测试")
+		button.position = Vector2(920.0 + index * 82.0, 42.0)
+		button.size = Vector2(76.0, 30.0)
+		button.pressed.connect(_switch_scenario.bind(scenario_id))
+		_scenario_buttons[scenario_id] = button
+		add_child(button)
+
+
+func _switch_scenario(scenario_id: StringName) -> void:
+	if _busy or scenario_id == _scenario_id:
+		return
+	for view in _actor_views.values():
+		view.queue_free()
+	_actor_views.clear()
+	if _battle_overlay != null:
+		_battle_overlay.end_encounter()
+	_scenario_id = scenario_id
+	_scenario = ScenarioCatalogType.definition(scenario_id)
+	_turn_number = 1
+	_selected_squad_id = &"player"
+	_parse_map()
+	_build_actor_views()
+	_refresh_squad_selectors()
+	_refresh_formation_panel()
+	_refresh_scenario_controls()
+	_update_interface("等待玩家输入", "%s已重置。" % _scenario["display_name"])
+	queue_redraw()
+
+
+func _refresh_scenario_controls() -> void:
+	for scenario_id: StringName in _scenario_buttons:
+		_scenario_buttons[scenario_id].disabled = (
+			_busy or scenario_id == _scenario_id
+		)
+
+
+func _set_scenario_controls_locked(locked: bool) -> void:
+	for scenario_id: StringName in _scenario_buttons:
+		_scenario_buttons[scenario_id].disabled = locked or scenario_id == _scenario_id
+
+
+func _on_ai_debug_toggled(_enabled: bool) -> void:
+	queue_redraw()
+
+
+func _refresh_squad_selectors() -> void:
+	_squad_selector_ids = _active_actor_ids()
+	for index in _squad_selector_buttons.size():
+		var button: Button = _squad_selector_buttons[index]
+		if index >= _squad_selector_ids.size():
+			button.hide()
+			continue
+		button.show()
+		button.text = "%s小队" % _actor_name(_squad_selector_ids[index])
+
+
+func _select_formation_squad_by_index(index: int) -> void:
+	if index < 0 or index >= _squad_selector_ids.size():
+		return
+	_select_formation_squad(_squad_selector_ids[index])
 
 
 func _select_formation_squad(actor_id: StringName) -> void:
@@ -730,6 +866,9 @@ func _format_turn_log(turn_index: int, intents: Dictionary, resolution) -> Strin
 				lines.append("  多人存活：退回回合初始格")
 			elif group["survivors"].size() == 1:
 				lines.append("  唯一幸存者：留在碰撞位置")
+	for event: Dictionary in resolution.enemy_events:
+		if event.get("kind", &"") == &"bandit_alerted":
+			lines.append("强盗发现主角：进入永久追击，下回合开始移动")
 	for actor_id: StringName in intents:
 		var intent = intents[actor_id]
 		var outcome: Dictionary = resolution.outcome_for(actor_id)
@@ -752,7 +891,20 @@ func _actor_name(actor_id: StringName) -> String:
 			return "主角"
 		&"dummy":
 			return "木桩"
+		&"robot":
+			return "机器人"
+		&"bandit":
+			return "强盗"
 	return String(actor_id)
+
+
+func _actor_color(actor_id: StringName) -> Color:
+	match actor_id:
+		&"player": return COLOR_PLAYER
+		&"dummy": return COLOR_DUMMY
+		&"robot": return COLOR_ROBOT
+		&"bandit": return COLOR_BANDIT
+	return COLOR_DUMMY
 
 
 func _intent_text(intent) -> String:
@@ -829,3 +981,74 @@ func _draw() -> void:
 			var floor_color := COLOR_FLOOR_A if (x + y) % 2 == 0 else COLOR_FLOOR_B
 			draw_rect(cell_rect, COLOR_WALL if _blocked.has(cell) else floor_color)
 			draw_rect(cell_rect, COLOR_GRID, false, 1.0)
+	if _ai_debug_toggle == null or not _ai_debug_toggle.button_pressed:
+		return
+	match _scenario_id:
+		ScenarioCatalogType.SCENARIO_ROBOT:
+			_draw_robot_debug()
+		ScenarioCatalogType.SCENARIO_BANDIT:
+			_draw_bandit_debug()
+
+
+func _draw_robot_debug() -> void:
+	if not _actors.has(&"robot") or not _enemy_brains.has(&"robot"):
+		return
+	var brain = _enemy_brains[&"robot"]
+	var next_target: Vector2i = _enemy_ai.robot_next_target(brain)
+	for index in brain.patrol_path.size():
+		var cell: Vector2i = brain.patrol_path[index]
+		var rect := Rect2(
+			BOARD_ORIGIN + Vector2(cell) * CELL_SIZE,
+			Vector2.ONE * CELL_SIZE
+		)
+		draw_rect(rect, COLOR_PATROL, true)
+		draw_string(
+			ThemeDB.fallback_font,
+			rect.position + Vector2(4.0, 14.0),
+			str(index + 1),
+			HORIZONTAL_ALIGNMENT_LEFT,
+			18.0,
+			10,
+			COLOR_TEXT
+		)
+		if cell == next_target:
+			draw_rect(rect.grow(-3.0), COLOR_ROBOT, false, 3.0)
+	var actor = _actors[&"robot"]
+	var direction_text := "顺时针" if brain.patrol_direction > 0 else "逆时针"
+	var phase_text := "移动" if brain.move_turn else "等待"
+	draw_string(
+		ThemeDB.fallback_font,
+		_cell_to_world(actor.cell) + Vector2(-72.0, 38.0),
+		"%s｜%s｜目标%s" % [phase_text, direction_text, next_target],
+		HORIZONTAL_ALIGNMENT_CENTER,
+		144.0,
+		11,
+		COLOR_TEXT
+	)
+
+
+func _draw_bandit_debug() -> void:
+	if not _actors.has(&"bandit") or not _enemy_brains.has(&"bandit"):
+		return
+	var actor = _actors[&"bandit"]
+	var brain = _enemy_brains[&"bandit"]
+	var visible := _enemy_ai.vision_cells(
+		actor.cell, actor.facing, _blocked, BOARD_SIZE
+	)
+	var vision_color := COLOR_ALERT_VISION if brain.alerted else COLOR_VISION
+	for cell: Vector2i in visible:
+		var rect := Rect2(
+			BOARD_ORIGIN + Vector2(cell) * CELL_SIZE,
+			Vector2.ONE * CELL_SIZE
+		)
+		draw_rect(rect.grow(-2.0), vision_color, true)
+	var state_text := "追击" if brain.alerted else "未察觉"
+	draw_string(
+		ThemeDB.fallback_font,
+		_cell_to_world(actor.cell) + Vector2(-52.0, 38.0),
+		"强盗｜%s" % state_text,
+		HORIZONTAL_ALIGNMENT_CENTER,
+		104.0,
+		11,
+		COLOR_TEXT
+	)

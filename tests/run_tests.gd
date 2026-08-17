@@ -5,7 +5,9 @@ const SquadUnitStateType = preload("res://scripts/model/squad_unit_state.gd")
 const GridActorStateType = preload("res://scripts/model/grid_actor_state.gd")
 const SquadBattleResolverType = preload("res://scripts/core/squad_battle_resolver.gd")
 const TurnResolverType = preload("res://scripts/core/turn_resolver.gd")
-const DrunkControllerType = preload("res://scripts/core/drunk_controller.gd")
+const EnemyAIControllerType = preload("res://scripts/core/enemy_ai_controller.gd")
+const EnemyBrainStateType = preload("res://scripts/model/enemy_brain_state.gd")
+const ScenarioCatalogType = preload("res://scripts/core/test_scenario_catalog.gd")
 const MainScene = preload("res://scenes/main.tscn")
 
 var _failures := 0
@@ -39,8 +41,12 @@ func _run_all() -> void:
 	_test_multi_squad_melee_inherits_damage_and_skips_eliminated()
 	_test_friendly_squads_do_not_fight()
 	_test_seeded_map_resolution_is_reproducible()
-	_test_pursuit_ai_is_stable_and_terrain_aware()
+	_test_robot_patrol_move_wait_loop()
+	_test_robot_reverse_and_collision_retry()
+	_test_bandit_vision_and_wall_occlusion()
+	_test_bandit_tentative_detection_and_pursuit()
 	await _test_main_scene_gm_panel_and_combat()
+	await _test_enemy_scenario_switching_and_debug()
 	await _test_focused_stage_auto_playback()
 	await _test_slow_motion_requires_one_step_per_action()
 	# Let queued scene/audio frees reach the ObjectDB before the command-line
@@ -49,7 +55,7 @@ func _run_all() -> void:
 	await get_tree().create_timer(0.15).timeout
 
 	if _failures == 0:
-		print("PASS: %d checks across 26 squad-combat scenarios." % _checks)
+		print("PASS: %d checks across 31 squad-combat scenarios." % _checks)
 		get_tree().quit(0)
 	else:
 		push_error("FAIL: %d of %d checks failed." % [_failures, _checks])
@@ -474,12 +480,171 @@ func _test_seeded_map_resolution_is_reproducible() -> void:
 	_expect_equal(target_ids[0], target_ids[1], "turn-level battle seed reproduces targeting")
 
 
-func _test_pursuit_ai_is_stable_and_terrain_aware() -> void:
-	var controller = DrunkControllerType.new(1)
-	var horizontal = controller.choose_pursuit_intent(&"enemy", Vector2i(3, 3), Vector2i(1, 1), {}, Vector2i(6, 6))
-	_expect_equal(horizontal.delta, Vector2i.LEFT, "pursuit AI uses stable horizontal-first rule")
-	var vertical = controller.choose_pursuit_intent(&"enemy", Vector2i(3, 3), Vector2i(1, 1), {Vector2i(2, 3): true}, Vector2i(6, 6))
-	_expect_equal(vertical.delta, Vector2i.UP, "terrain forces learnable vertical alternative")
+func _test_robot_patrol_move_wait_loop() -> void:
+	var controller = EnemyAIControllerType.new()
+	var path: Array = ScenarioCatalogType.definition(&"robot")["patrol_path"]
+	var brain = EnemyBrainStateType.new(&"robot", EnemyBrainStateType.BEHAVIOR_ROBOT, path)
+	var robot = _squad(&"robot", &"robot", &"npc", path[0], [
+		_unit(&"robot_u", &"tank", 1, 0, 30, 0, 1),
+	], Vector2i.RIGHT)
+	var move_count := 0
+	var wait_count := 0
+	for turn_index in 16:
+		var intent = controller.choose_intent(brain, robot, null, {}, Vector2i(12, 8))
+		if turn_index == 0:
+			_expect_equal(intent.delta, Vector2i.RIGHT, "robot begins clockwise from the patrol top-left")
+		if intent.action_type == TurnIntentType.ActionType.MOVE:
+			move_count += 1
+		else:
+			wait_count += 1
+		var resolution = _resolve(
+			Vector2i(12, 8), [], [robot], {&"robot": intent}, 1000 + turn_index
+		)
+		controller.commit_after_turn(brain, resolution, {}, Vector2i(12, 8))
+		robot = resolution.actor_state_for(&"robot")
+	_expect_equal(move_count, 8, "robot moves exactly eight times in a sixteen-turn loop")
+	_expect_equal(wait_count, 8, "robot waits after every patrol move")
+	_expect_equal(robot.cell, path[0], "robot completes the 3x3 perimeter loop")
+	_expect_equal(brain.patrol_index, 0, "patrol index returns to its starting waypoint")
+	_expect_true(brain.move_turn, "robot is ready to move after the final wait turn")
+
+
+func _test_robot_reverse_and_collision_retry() -> void:
+	var controller = EnemyAIControllerType.new()
+	var path: Array = ScenarioCatalogType.definition(&"robot")["patrol_path"]
+	var brain = EnemyBrainStateType.new(&"robot", EnemyBrainStateType.BEHAVIOR_ROBOT, path)
+	brain.patrol_index = 1
+	var robot = _squad(&"robot", &"robot", &"npc", path[1], [
+		_unit(&"robot_u", &"tank", 1, 0, 30, 0, 1),
+	], Vector2i.RIGHT)
+	var wall_map := {path[2]: true}
+	var reverse_intent = controller.choose_intent(
+		brain, robot, null, wall_map, Vector2i(12, 8)
+	)
+	_expect_equal(brain.patrol_direction, -1, "blocked clockwise waypoint reverses patrol direction immediately")
+	_expect_equal(reverse_intent.delta, Vector2i.LEFT, "robot moves counterclockwise in the same turn")
+	var reverse_result = _resolve(
+		Vector2i(12, 8), [path[2]], [robot], {&"robot": reverse_intent}, 1101
+	)
+	controller.commit_after_turn(brain, reverse_result, wall_map, Vector2i(12, 8))
+	_expect_equal(brain.patrol_index, 0, "successful reverse movement commits the previous waypoint")
+
+	var collision_brain = EnemyBrainStateType.new(&"robot", EnemyBrainStateType.BEHAVIOR_ROBOT, path)
+	var collision_robot = _squad(&"robot", &"robot", &"npc", path[0], [
+		_unit(&"robot_c", &"custom", 1, 0, 30, 0, 1),
+	], Vector2i.RIGHT)
+	var blocker = _squad(&"blocker", &"blocker", &"npc", path[1], [
+		_unit(&"blocker_u", &"custom", 1, 0, 30, 0, 1),
+	], Vector2i.LEFT)
+	var collision_intent = controller.choose_intent(
+		collision_brain, collision_robot, null, {}, Vector2i(12, 8)
+	)
+	var collision_result = _resolve(
+		Vector2i(12, 8), [], [collision_robot, blocker], {
+			&"robot": collision_intent, &"blocker": _wait(&"blocker"),
+		}, 1102
+	)
+	controller.commit_after_turn(collision_brain, collision_result, {}, Vector2i(12, 8))
+	_expect_equal(collision_result.final_positions[&"robot"], path[0], "surviving robot returns after collision")
+	_expect_equal(collision_brain.patrol_index, 0, "collision return does not advance patrol progress")
+	_expect_true(not collision_brain.move_turn, "collision attempt is followed by a wait phase")
+	var wait_intent = controller.choose_intent(
+		collision_brain, collision_result.actor_state_for(&"robot"), null, {}, Vector2i(12, 8)
+	)
+	_expect_equal(wait_intent.action_type, TurnIntentType.ActionType.WAIT, "robot waits before retrying a collision waypoint")
+	var wait_result = _resolve(
+		Vector2i(12, 8), [], [collision_result.actor_state_for(&"robot")],
+		{&"robot": wait_intent}, 1103
+	)
+	controller.commit_after_turn(collision_brain, wait_result, {}, Vector2i(12, 8))
+	var retry = controller.choose_intent(
+		collision_brain, wait_result.actor_state_for(&"robot"), null, {}, Vector2i(12, 8)
+	)
+	_expect_equal(retry.delta, Vector2i.RIGHT, "robot retries the uncommitted waypoint after waiting")
+
+
+func _test_bandit_vision_and_wall_occlusion() -> void:
+	var controller = EnemyAIControllerType.new()
+	var origin := Vector2i(4, 4)
+	var visible := controller.vision_cells(origin, Vector2i.UP, {}, Vector2i(10, 10))
+	for expected: Vector2i in [
+		Vector2i(3, 4), Vector2i(5, 4),
+		Vector2i(3, 3), Vector2i(4, 3), Vector2i(5, 3),
+		Vector2i(3, 2), Vector2i(4, 2), Vector2i(5, 2),
+		Vector2i(2, 1), Vector2i(4, 1), Vector2i(6, 1),
+	]:
+		_expect_true(visible.has(expected), "bandit vision includes shortened continuous cone cell %s" % expected)
+	for hidden: Vector2i in [
+		Vector2i(2, 4), Vector2i(6, 4),
+		Vector2i(3, 5), Vector2i(4, 5), Vector2i(5, 5),
+		Vector2i(4, 0),
+	]:
+		_expect_true(not visible.has(hidden), "bandit vision excludes distant side, rear, or fourth-layer cell %s" % hidden)
+	var wall_visible := controller.vision_cells(
+		origin, Vector2i.UP, {Vector2i(4, 2): true}, Vector2i(10, 10)
+	)
+	_expect_true(not wall_visible.has(Vector2i(4, 1)), "terrain hides cone cells behind it")
+	var right_visible := controller.vision_cells(
+		origin, Vector2i.RIGHT, {}, Vector2i(10, 10)
+	)
+	_expect_true(right_visible.has(Vector2i(7, 4)), "vision cone rotates with a right-facing bandit")
+	_expect_true(right_visible.has(Vector2i(4, 3)), "immediate side vision rotates with bandit facing")
+	_expect_true(not right_visible.has(Vector2i(3, 3)), "rear diagonal remains blind after rotating")
+
+
+func _test_bandit_tentative_detection_and_pursuit() -> void:
+	var controller = EnemyAIControllerType.new()
+	var brain = EnemyBrainStateType.new(&"bandit", EnemyBrainStateType.BEHAVIOR_BANDIT)
+	var player = _squad(&"player", &"player", &"player", Vector2i(1, 2), [
+		_unit(&"p", &"custom", 1, 0, 30, 0, 1),
+	], Vector2i.RIGHT)
+	var blocker = _squad(&"blocker", &"bandit", &"npc", Vector2i(2, 2), [
+		_unit(&"block", &"custom", 1, 0, 30, 0, 1),
+	], Vector2i.LEFT)
+	var bandit = _squad(&"bandit", &"bandit", &"npc", Vector2i(5, 2), [
+		_unit(&"b", &"warrior", 1, 0, 30, 0, 1),
+	], Vector2i.LEFT)
+	var resolution = _resolve(
+		Vector2i(8, 5), [], [player, blocker, bandit], {
+			&"player": _move(&"player", Vector2i.RIGHT),
+			&"blocker": _wait(&"blocker"),
+			&"bandit": _wait(&"bandit"),
+		}, 1201
+	)
+	_expect_equal(resolution.final_positions[&"player"], Vector2i(1, 2), "player returns after entering an occupied visible cell")
+	var alert_events := controller.commit_after_turn(
+		brain, resolution, {}, Vector2i(8, 5)
+	)
+	_expect_true(brain.alerted, "bandit detects the player's tentative pre-return position")
+	_expect_equal(alert_events[0]["kind"], &"bandit_alerted", "detection emits an explicit alert event")
+	var pursuit = controller.choose_intent(
+		brain,
+		resolution.actor_state_for(&"bandit"),
+		resolution.actor_state_for(&"player"),
+		{},
+		Vector2i(8, 5)
+	)
+	_expect_equal(pursuit.delta, Vector2i.LEFT, "alerted bandit pursues on the following turn")
+	var tie_bandit = _squad(&"tie", &"bandit", &"npc", Vector2i(3, 3), [
+		_unit(&"tie_u", &"warrior", 1, 0, 20, 1, 1),
+	], Vector2i.UP)
+	var tie_player = _squad(&"target", &"player", &"player", Vector2i(2, 2), [
+		_unit(&"target_u", &"custom", 1, 0, 20, 0, 1),
+	])
+	var tie_brain = EnemyBrainStateType.new(&"tie", EnemyBrainStateType.BEHAVIOR_BANDIT)
+	tie_brain.alerted = true
+	var tie_intent = controller.choose_intent(
+		tie_brain, tie_bandit, tie_player, {}, Vector2i(7, 7)
+	)
+	_expect_equal(tie_intent.delta, Vector2i.UP, "equal shortest paths prefer continuing forward")
+	var trapped := {
+		Vector2i(3, 2): true, Vector2i(2, 3): true,
+		Vector2i(4, 3): true, Vector2i(3, 4): true,
+	}
+	var trapped_intent = controller.choose_intent(
+		tie_brain, tie_bandit, tie_player, trapped, Vector2i(7, 7)
+	)
+	_expect_equal(trapped_intent.action_type, TurnIntentType.ActionType.WAIT, "bandit waits when no path exists")
 
 
 func _test_main_scene_gm_panel_and_combat() -> void:
@@ -507,6 +672,48 @@ func _test_main_scene_gm_panel_and_combat() -> void:
 	var preview := get_viewport().get_texture().get_image()
 	_expect_true(not preview.is_empty(), "squad prototype renders a viewport")
 	_expect_equal(preview.save_png(ProjectSettings.globalize_path("res://.godot/test_preview.png")), OK, "squad preview can be captured")
+	main.queue_free()
+	await get_tree().process_frame
+
+
+func _test_enemy_scenario_switching_and_debug() -> void:
+	var main = MainScene.instantiate()
+	add_child(main)
+	await get_tree().process_frame
+	_expect_equal(main._scenario_buttons.size(), 3, "GM panel exposes all three enemy test modes")
+	_expect_true(main._ai_debug_toggle.button_pressed, "AI debug overlay defaults to visible")
+	main._switch_scenario(ScenarioCatalogType.SCENARIO_ROBOT)
+	await get_tree().process_frame
+	_expect_equal(main._scenario_id, &"robot", "robot test mode becomes active")
+	_expect_true(main._actors.has(&"robot"), "robot scenario spawns a robot squad")
+	_expect_equal(main._enemy_brains[&"robot"].patrol_path.size(), 8, "robot scenario exposes the 3x3 perimeter")
+	var robot_classes: Array = []
+	for unit in main._actors[&"robot"].units:
+		robot_classes.append(unit.unit_class)
+	_expect_equal(robot_classes.count(&"tank"), 2, "robot formation contains two tanks")
+	_expect_equal(robot_classes.count(&"archer"), 2, "robot formation contains two archers")
+	var robot_preview := get_viewport().get_texture().get_image()
+	_expect_equal(robot_preview.save_png(ProjectSettings.globalize_path("res://.godot/robot_scenario_preview.png")), OK, "robot debug scenario can be captured")
+	await main._play_turn(_wait(&"player"))
+	_expect_equal(main._actors[&"robot"].cell, Vector2i(7, 2), "robot moves clockwise on scenario turn one")
+	await main._play_turn(_wait(&"player"))
+	_expect_equal(main._actors[&"robot"].cell, Vector2i(7, 2), "robot waits on scenario turn two")
+	main._switch_scenario(ScenarioCatalogType.SCENARIO_BANDIT)
+	await get_tree().process_frame
+	_expect_equal(main._turn_number, 1, "scenario switch resets turn count")
+	_expect_true(not main._enemy_brains[&"bandit"].alerted, "bandit scenario begins unaware")
+	var bandit_classes: Array = []
+	for unit in main._actors[&"bandit"].units:
+		bandit_classes.append(unit.unit_class)
+	_expect_equal(bandit_classes.count(&"warrior"), 2, "bandit formation contains two warriors")
+	_expect_equal(bandit_classes.count(&"assassin"), 2, "bandit formation contains two assassins")
+	var bandit_preview := get_viewport().get_texture().get_image()
+	_expect_equal(bandit_preview.save_png(ProjectSettings.globalize_path("res://.godot/bandit_scenario_preview.png")), OK, "bandit vision scenario can be captured")
+	main._ai_debug_toggle.button_pressed = false
+	main._switch_scenario(ScenarioCatalogType.SCENARIO_DUMMY)
+	await get_tree().process_frame
+	_expect_true(not main._ai_debug_toggle.button_pressed, "scenario switch preserves the debug overlay preference")
+	_expect_true(main._actors.has(&"dummy"), "dummy scenario restores the stationary target")
 	main.queue_free()
 	await get_tree().process_frame
 
