@@ -3,6 +3,13 @@ extends RefCounted
 const TurnIntentType = preload("res://scripts/model/turn_intent.gd")
 const TurnResolutionType = preload("res://scripts/model/turn_resolution.gd")
 const SquadBattleResolverType = preload("res://scripts/core/squad_battle_resolver.gd")
+const SquadUnitStateType = preload("res://scripts/model/squad_unit_state.gd")
+
+const SKILL_BANDAGE := &"bandage"
+const BANDAGE_HEAL := 2
+const PASSIVE_BANDAGE_USED := &"bandage_used"
+const PASSIVE_BATTLE_HARDENED_COUNT := &"battle_hardened_count"
+const PASSIVE_BATTLE_HARDENED_USED := &"battle_hardened_used"
 
 const VALID_DELTAS := [
 	Vector2i.UP,
@@ -28,6 +35,7 @@ static func resolve(
 	var last_sources: Dictionary = {}
 	var valid_movers: Dictionary = {}
 	var actor_reasons: Dictionary = {}
+	var pending_grid_skills: Array = []
 
 	for source_actor in actor_states:
 		var actor = source_actor.clone()
@@ -57,6 +65,16 @@ static func resolve(
 
 		if intent.action_type == TurnIntentType.ActionType.WAIT:
 			actor_reasons[actor_id] = &"waited"
+		elif intent.action_type == TurnIntentType.ActionType.USE_SKILL:
+			var skill_event := _prepare_grid_skill(states[actor_id], intent)
+			if skill_event.get("valid", false):
+				movement_result["reason"] = &"used_grid_skill"
+				actor_reasons[actor_id] = &"used_grid_skill"
+				pending_grid_skills.append(skill_event)
+			else:
+				movement_result["valid"] = false
+				movement_result["reason"] = skill_event.get("reason", &"invalid_grid_skill")
+				actor_reasons[actor_id] = movement_result["reason"]
 		elif intent.action_type != TurnIntentType.ActionType.MOVE or not intent.delta in VALID_DELTAS:
 			movement_result["valid"] = false
 			movement_result["reason"] = &"invalid_direction"
@@ -156,6 +174,8 @@ static func resolve(
 		next_wave_index += 1
 		grid_wave_count += 1
 
+	_resolve_grid_skills(pending_grid_skills, states, dead_actor_ids, result)
+
 	# Commit final living states and summarize each actor's complete turn.
 	result.final_positions.clear()
 	for actor_id: StringName in actor_ids:
@@ -172,7 +192,8 @@ static func resolve(
 		var reason: StringName = actor_reasons.get(actor_id, &"waited")
 		var moved: bool = actor.cell != initial_positions[actor_id]
 		var success: bool = reason in [
-			&"moved", &"waited", &"combat_winner_moved", &"combat_winner_held"
+			&"moved", &"waited", &"used_grid_skill",
+			&"combat_winner_moved", &"combat_winner_held"
 		]
 		result.set_outcome(actor_id, success, moved, reason, actor.cell)
 
@@ -246,6 +267,16 @@ static func _resolve_collision_wave(
 			var engagement := _build_engagement(
 				first_id, second_id, center, last_sources, states
 			)
+			var first_had_warrior: bool = first.has_living_class(SquadUnitStateType.CLASS_WARRIOR)
+			var second_had_warrior: bool = second.has_living_class(SquadUnitStateType.CLASS_WARRIOR)
+			var first_class_advantage := _battle_hardened_bonus(first)
+			var second_class_advantage := _battle_hardened_bonus(second)
+			engagement["first_direction_advantage"] = engagement["first_advantage"]
+			engagement["second_direction_advantage"] = engagement["second_advantage"]
+			engagement["first_class_advantage"] = first_class_advantage
+			engagement["second_class_advantage"] = second_class_advantage
+			engagement["first_advantage"] += first_class_advantage
+			engagement["second_advantage"] += second_class_advantage
 			var encounter: Dictionary = SquadBattleResolverType.resolve_round(
 				first,
 				second,
@@ -254,6 +285,8 @@ static func _resolve_collision_wave(
 				engagement["second_advantage"],
 				engagement
 			)
+			_record_battle_hardened_encounter(first, first_had_warrior)
+			_record_battle_hardened_encounter(second, second_had_warrior)
 			encounter["pair_index"] = pair_index
 			encounter["skipped"] = false
 			for unit_event: Dictionary in encounter["events"]:
@@ -477,6 +510,84 @@ static func _build_engagement(
 		"first_advantage": maxi(first_score - second_score, 0),
 		"second_advantage": maxi(second_score - first_score, 0),
 	}
+
+
+static func _prepare_grid_skill(actor, intent) -> Dictionary:
+	var event := {
+		"valid": false,
+		"actor_id": actor.actor_id,
+		"source_unit_id": intent.source_unit_id,
+		"skill_id": intent.skill_id,
+		"status": &"invalid",
+		"heals": [],
+	}
+	if intent.skill_id != SKILL_BANDAGE:
+		event["reason"] = &"unknown_grid_skill"
+		return event
+	if actor.map_passive_state.get(PASSIVE_BANDAGE_USED, false):
+		event["reason"] = &"grid_skill_already_used"
+		return event
+	var source = actor.unit_by_id(intent.source_unit_id)
+	if source == null or not source.is_alive() or source.unit_class != SquadUnitStateType.CLASS_WARRIOR:
+		event["reason"] = &"invalid_skill_source"
+		return event
+	actor.map_passive_state[PASSIVE_BANDAGE_USED] = true
+	event["valid"] = true
+	event["status"] = &"pending"
+	return event
+
+
+static func _resolve_grid_skills(
+	pending_grid_skills: Array,
+	states: Dictionary,
+	dead_actor_ids: Array,
+	result
+) -> void:
+	for pending: Dictionary in pending_grid_skills:
+		var event := pending.duplicate(true)
+		var actor_id: StringName = event["actor_id"]
+		var actor = states.get(actor_id)
+		var source = actor.unit_by_id(event["source_unit_id"]) if actor != null else null
+		if actor == null or actor_id in dead_actor_ids or source == null or not source.is_alive():
+			event["status"] = &"source_dead"
+			result.grid_skill_events.append(event)
+			continue
+		var heals: Array = []
+		for unit in actor.units:
+			if not unit.is_alive():
+				continue
+			var health_before: int = unit.health
+			unit.health = mini(unit.health + BANDAGE_HEAL, unit.max_health)
+			heals.append({
+				"unit_id": unit.unit_id,
+				"health_before": health_before,
+				"health_after": unit.health,
+				"amount": unit.health - health_before,
+			})
+		actor.sync_summary_stats()
+		event["status"] = &"resolved"
+		event["heals"] = heals
+		result.grid_skill_events.append(event)
+
+
+static func _battle_hardened_bonus(squad) -> int:
+	if not squad.has_living_class(SquadUnitStateType.CLASS_WARRIOR):
+		return 0
+	if squad.map_passive_state.get(PASSIVE_BATTLE_HARDENED_USED, false):
+		return 0
+	if squad.map_passive_state.get(PASSIVE_BATTLE_HARDENED_COUNT, 0) < 2:
+		return 0
+	squad.map_passive_state[PASSIVE_BATTLE_HARDENED_USED] = true
+	return 1
+
+
+static func _record_battle_hardened_encounter(squad, had_living_warrior: bool) -> void:
+	if not had_living_warrior:
+		return
+	if squad.map_passive_state.get(PASSIVE_BATTLE_HARDENED_USED, false):
+		return
+	var count: int = squad.map_passive_state.get(PASSIVE_BATTLE_HARDENED_COUNT, 0)
+	squad.map_passive_state[PASSIVE_BATTLE_HARDENED_COUNT] = mini(count + 1, 2)
 
 
 static func _contact_info(

@@ -11,6 +11,7 @@ var max_health: int
 var attack: int
 var units: Array
 var facing: Vector2i
+var map_passive_state: Dictionary
 
 
 func _init(
@@ -22,13 +23,15 @@ func _init(
 	p_max_health: int = 1,
 	p_attack: int = 0,
 	p_units: Array = [],
-	p_facing: Vector2i = Vector2i.DOWN
+	p_facing: Vector2i = Vector2i.DOWN,
+	p_map_passive_state: Dictionary = {}
 ) -> void:
 	actor_id = p_actor_id
 	cell = p_cell
 	controller = p_controller
 	faction = p_faction
 	facing = p_facing
+	map_passive_state = p_map_passive_state.duplicate(true)
 	units = []
 	for source_unit in p_units:
 		units.append(source_unit.clone())
@@ -58,7 +61,8 @@ func clone():
 		max_health,
 		attack,
 		units,
-		facing
+		facing,
+		map_passive_state
 	)
 
 
@@ -84,6 +88,13 @@ func living_units_in_row(row: int) -> Array:
 
 func living_unit_count() -> int:
 	return living_units().size()
+
+
+func has_living_class(unit_class: StringName) -> bool:
+	for unit in units:
+		if unit.is_alive() and unit.unit_class == unit_class:
+			return true
+	return false
 
 
 func unit_by_id(unit_id: StringName):

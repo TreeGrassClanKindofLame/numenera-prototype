@@ -28,6 +28,7 @@ const FAILED_MOVE_BUMP_DISTANCE := 10.0
 const COLLISION_STAGING_DISTANCE := 11.0
 const RNG_SEED := 1337
 const UNIT_CLASS_CYCLE := [&"", &"tank", &"warrior", &"archer", &"assassin"]
+const SKILL_BANDAGE := &"bandage"
 
 const COLOR_BACKGROUND := Color("111722")
 const COLOR_FLOOR_A := Color("202b3a")
@@ -59,6 +60,8 @@ var _turn_label: Label
 var _status_label: Label
 var _log_label: Label
 var _formation_labels: Dictionary = {}
+var _formation_resource_bars: Dictionary = {}
+var _formation_resource_labels: Dictionary = {}
 var _selected_squad_id: StringName = &"player"
 var _battle_overlay
 var _battle_slow_motion_enabled := false
@@ -68,6 +71,8 @@ var _ai_debug_toggle: CheckButton
 var _scenario_buttons: Dictionary = {}
 var _squad_selector_ids: Array = []
 var _squad_selector_buttons: Array = []
+var _bandage_button: Button
+var _bandage_targeting := false
 
 
 func _ready() -> void:
@@ -97,6 +102,11 @@ func _unhandled_input(event: InputEvent) -> void:
 		return
 	if _busy or not _actors.has(&"player"):
 		return
+	if _bandage_targeting:
+		if key_event.keycode == KEY_ESCAPE:
+			get_viewport().set_input_as_handled()
+			_cancel_bandage_targeting()
+		return
 
 	var player_intent = null
 	if event.is_action_pressed(&"move_up"):
@@ -120,6 +130,8 @@ func _play_turn(player_intent) -> void:
 	if _busy or not _actors.has(&"player"):
 		return
 	_busy = true
+	_bandage_targeting = false
+	_refresh_bandage_button()
 	_set_slow_motion_toggle_locked(true)
 	_set_scenario_controls_locked(true)
 	_update_interface("正在结算第 %d 回合…" % _turn_number, _log_label.text)
@@ -209,6 +221,27 @@ func _play_resolution_animation(
 		if wave_index + 1 < resolution.collision_waves.size():
 			next_wave = resolution.collision_waves[wave_index + 1]
 		await _play_wave_settle(wave, next_wave)
+	await _play_grid_skill_events(resolution.grid_skill_events)
+
+
+func _play_grid_skill_events(events: Array) -> void:
+	for event: Dictionary in events:
+		if event.get("skill_id", &"") != SKILL_BANDAGE:
+			continue
+		var actor_id: StringName = event.get("actor_id", &"")
+		if event.get("status", &"") != &"resolved" or not _actor_views.has(actor_id):
+			continue
+		var total_heal := 0
+		for heal: Dictionary in event.get("heals", []):
+			total_heal += heal.get("amount", 0)
+		var view = _actor_views[actor_id]
+		view.set_health(view.health + total_heal)
+		var pulse := create_tween()
+		pulse.tween_property(view, "modulate", Color("8dffae"), SETTLE_DURATION * 0.5)
+		pulse.parallel().tween_property(view, "scale", Vector2.ONE * 1.12, SETTLE_DURATION * 0.5)
+		pulse.tween_property(view, "modulate", Color.WHITE, SETTLE_DURATION * 0.5)
+		pulse.parallel().tween_property(view, "scale", Vector2.ONE, SETTLE_DURATION * 0.5)
+		await pulse.finished
 
 
 func _build_collision_stages(resolution) -> Dictionary:
@@ -638,6 +671,11 @@ func _build_interface() -> void:
 	_ai_debug_toggle.button_pressed = true
 	_ai_debug_toggle.toggled.connect(_on_ai_debug_toggled)
 	add_child(_ai_debug_toggle)
+	_bandage_button = Button.new()
+	_bandage_button.position = Vector2(960.0, 350.0)
+	_bandage_button.size = Vector2(208.0, 40.0)
+	_bandage_button.pressed.connect(_on_bandage_pressed)
+	add_child(_bandage_button)
 	_build_formation_panel()
 	add_child(_make_label(
 		"上一回合",
@@ -660,13 +698,30 @@ func _build_formation_panel() -> void:
 		for column in 3:
 			var slot := Vector2i(column, row)
 			var button := Button.new()
-			button.position = Vector2(644.0 + column * 104.0, 312.0 + row * 62.0)
-			button.size = Vector2(96.0, 54.0)
+			button.position = Vector2(644.0 + column * 104.0, 312.0 + row * 72.0)
+			button.size = Vector2(96.0, 68.0)
+			button.add_theme_font_size_override("font_size", 12)
 			button.pressed.connect(_cycle_formation_slot.bind(slot))
+			var resource_bar := ProgressBar.new()
+			resource_bar.position = Vector2(6.0, 54.0)
+			resource_bar.size = Vector2(84.0, 10.0)
+			resource_bar.show_percentage = false
+			resource_bar.mouse_filter = Control.MOUSE_FILTER_IGNORE
+			button.add_child(resource_bar)
+			var resource_label := Label.new()
+			resource_label.position = Vector2(6.0, 50.0)
+			resource_label.size = Vector2(84.0, 18.0)
+			resource_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+			resource_label.add_theme_font_size_override("font_size", 10)
+			resource_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
+			button.add_child(resource_label)
 			_formation_labels[slot] = button
+			_formation_resource_bars[slot] = resource_bar
+			_formation_resource_labels[slot] = resource_label
 			add_child(button)
 	_refresh_squad_selectors()
 	_refresh_formation_panel()
+	_refresh_bandage_button()
 
 
 func _build_scenario_controls() -> void:
@@ -694,6 +749,7 @@ func _switch_scenario(scenario_id: StringName) -> void:
 	_scenario = ScenarioCatalogType.definition(scenario_id)
 	_turn_number = 1
 	_selected_squad_id = &"player"
+	_bandage_targeting = false
 	_parse_map()
 	_build_actor_views()
 	_refresh_squad_selectors()
@@ -746,6 +802,9 @@ func _select_formation_squad(actor_id: StringName) -> void:
 func _cycle_formation_slot(slot: Vector2i) -> void:
 	if _busy or not _actors.has(_selected_squad_id):
 		return
+	if _bandage_targeting:
+		_confirm_bandage_source(slot)
+		return
 	var squad = _actors[_selected_squad_id]
 	var existing = squad.unit_at(slot)
 	var current_class: StringName = existing.unit_class if existing != null else &""
@@ -769,16 +828,140 @@ func _refresh_formation_panel() -> void:
 	var squad = _actors[_selected_squad_id]
 	for slot: Vector2i in _formation_labels:
 		var button: Button = _formation_labels[slot]
+		var resource_bar: ProgressBar = _formation_resource_bars[slot]
+		var resource_label: Label = _formation_resource_labels[slot]
 		var unit = squad.unit_at(slot)
 		var row_name := "前" if slot.y == 0 else "后"
 		if unit == null:
 			button.text = "%s%d｜空" % [row_name, slot.x + 1]
+			resource_bar.hide()
+			resource_label.hide()
 		else:
 			var unit_name: String = "木桩" if _selected_squad_id == &"dummy" and unit.unit_class == SquadUnitStateType.CLASS_CUSTOM else unit.class_name_zh()
 			button.text = "%s%d｜%s\nHP%d 攻%d 速%d" % [
 				row_name, slot.x + 1, unit_name,
 				maxi(unit.health, 0), unit.attack, unit.speed,
 			]
+			var resource_id := _unit_resource_id(unit)
+			if resource_id == &"":
+				resource_bar.hide()
+				resource_label.hide()
+			else:
+				resource_bar.max_value = unit.resource_max(resource_id)
+				resource_bar.value = unit.resource_value(resource_id)
+				var background := StyleBoxFlat.new()
+				background.bg_color = Color("202a38")
+				background.corner_radius_top_left = 3
+				background.corner_radius_top_right = 3
+				background.corner_radius_bottom_left = 3
+				background.corner_radius_bottom_right = 3
+				var fill := StyleBoxFlat.new()
+				fill.bg_color = Color("e4a64f") if resource_id == SquadUnitStateType.RESOURCE_TP else Color("558ee6")
+				fill.corner_radius_top_left = 3
+				fill.corner_radius_top_right = 3
+				fill.corner_radius_bottom_left = 3
+				fill.corner_radius_bottom_right = 3
+				resource_bar.add_theme_stylebox_override("background", background)
+				resource_bar.add_theme_stylebox_override("fill", fill)
+				resource_bar.tooltip_text = "%s %d/%d" % [
+					String(resource_id).to_upper(),
+					unit.resource_value(resource_id),
+					unit.resource_max(resource_id),
+				]
+				resource_label.text = "%s %d/%d" % [
+					String(resource_id).to_upper(),
+					unit.resource_value(resource_id),
+					unit.resource_max(resource_id),
+				]
+				resource_bar.show()
+				resource_label.show()
+		button.modulate = (
+			Color("8dffae")
+			if _bandage_targeting and unit != null and _can_source_bandage(unit)
+			else Color.WHITE
+		)
+	_refresh_bandage_button()
+
+
+func _unit_resource_id(unit) -> StringName:
+	for resource_id: StringName in [SquadUnitStateType.RESOURCE_TP, SquadUnitStateType.RESOURCE_MP]:
+		if unit.has_resource(resource_id):
+			return resource_id
+	return &""
+
+
+func _on_bandage_pressed() -> void:
+	if _busy or not _actors.has(&"player"):
+		return
+	if _bandage_targeting:
+		_cancel_bandage_targeting()
+		return
+	if not _bandage_available():
+		return
+	_bandage_targeting = true
+	_selected_squad_id = &"player"
+	_status_label.text = "包扎｜请选择一名存活战士（再次点击技能或 Esc 取消）"
+	_refresh_formation_panel()
+
+
+func _cancel_bandage_targeting() -> void:
+	_bandage_targeting = false
+	_status_label.text = "等待玩家输入"
+	_refresh_formation_panel()
+
+
+func _confirm_bandage_source(slot: Vector2i) -> void:
+	if not _actors.has(&"player"):
+		_cancel_bandage_targeting()
+		return
+	var unit = _actors[&"player"].unit_at(slot)
+	if not _bandage_available() or unit == null or not _can_source_bandage(unit):
+		_status_label.text = "该单位不能包扎：需要存活战士且本地图尚未使用"
+		return
+	_bandage_targeting = false
+	_refresh_formation_panel()
+	_play_turn(TurnIntentType.new(
+		&"player",
+		TurnIntentType.ActionType.USE_SKILL,
+		Vector2i.ZERO,
+		SKILL_BANDAGE,
+		unit.unit_id
+	))
+
+
+func _can_source_bandage(unit) -> bool:
+	return (
+		unit != null
+		and unit.is_alive()
+		and unit.unit_class == SquadUnitStateType.CLASS_WARRIOR
+	)
+
+
+func _bandage_available() -> bool:
+	if not _actors.has(&"player"):
+		return false
+	if _actors[&"player"].map_passive_state.get(&"bandage_used", false):
+		return false
+	for unit in _actors[&"player"].units:
+		if _can_source_bandage(unit):
+			return true
+	return false
+
+
+func _refresh_bandage_button() -> void:
+	if _bandage_button == null:
+		return
+	var already_used: bool = (
+		_actors.has(&"player")
+		and _actors[&"player"].map_passive_state.get(&"bandage_used", false)
+	)
+	if _bandage_targeting:
+		_bandage_button.text = "取消包扎选择"
+	elif already_used:
+		_bandage_button.text = "包扎｜本地图已使用"
+	else:
+		_bandage_button.text = "包扎｜本地图 1 次"
+	_bandage_button.disabled = _busy or (not _bandage_targeting and not _bandage_available())
 
 
 func _make_label(
@@ -830,11 +1013,15 @@ func _format_turn_log(turn_index: int, intents: Dictionary, resolution) -> Strin
 						_actor_name(encounter["first_squad_id"]),
 						encounter["first_advantage"],
 					]
+					if engagement.get("first_class_advantage", 0) > 0:
+						advantage_text += "（含越战越勇1）"
 				elif encounter.get("second_advantage", 0) > 0:
 					advantage_text = "%s优势%d" % [
 						_actor_name(encounter["second_squad_id"]),
 						encounter["second_advantage"],
 					]
+					if engagement.get("second_class_advantage", 0) > 0:
+						advantage_text += "（含越战越勇1）"
 				lines.append("  接敌：%s%d vs %s%d → %s" % [
 					_contact_side_text(first_contact.get("side", &"front")),
 					first_contact.get("score", 2),
@@ -845,9 +1032,18 @@ func _format_turn_log(turn_index: int, intents: Dictionary, resolution) -> Strin
 			if group["combat_events"].is_empty():
 				lines.append("  同阵营：跳过战斗")
 			for event: Dictionary in group["combat_events"]:
+				var action_text := "连击" if event.get("action_kind", &"normal_attack") == &"combo_attack" else "普攻"
+				if event.get("damage_bonus", 0) > 0:
+					action_text += "+浴血"
+				var resource_text := ""
+				if event.get("resource_id", &"") != &"":
+					resource_text = " TP%d→%d" % [
+						event.get("resource_before", 0), event.get("resource_after", 0)
+					]
 				lines.append(
-					"  %s｜%s/%s → %s/%s  %d→%d%s" % [
+					"  %s·%s｜%s/%s → %s/%s  %d→%d%s%s" % [
 						"第零回合" if event.get("phase", &"round_one") == &"round_zero" else "第一回合",
+						action_text,
 						_actor_name(event["attacker_squad_id"]),
 						String(event["attacker_unit_id"]),
 						_actor_name(event["defender_squad_id"]),
@@ -855,6 +1051,7 @@ func _format_turn_log(turn_index: int, intents: Dictionary, resolution) -> Strin
 						event["health_before"],
 						event["health_after"],
 						" 死亡" if event["target_died"] else "",
+						resource_text,
 					]
 				)
 			if not group["dead_actor_ids"].is_empty():
@@ -869,6 +1066,16 @@ func _format_turn_log(turn_index: int, intents: Dictionary, resolution) -> Strin
 	for event: Dictionary in resolution.enemy_events:
 		if event.get("kind", &"") == &"bandit_alerted":
 			lines.append("强盗发现主角：进入永久追击，下回合开始移动")
+	for event: Dictionary in resolution.grid_skill_events:
+		if event.get("skill_id", &"") != SKILL_BANDAGE:
+			continue
+		if event.get("status", &"") == &"source_dead":
+			lines.append("包扎：本地图次数已使用，施术战士阵亡，治疗未生效")
+		else:
+			var total_heal := 0
+			for heal: Dictionary in event.get("heals", []):
+				total_heal += heal.get("amount", 0)
+			lines.append("包扎：本地图次数已使用，小队共恢复 %d HP" % total_heal)
 	for actor_id: StringName in intents:
 		var intent = intents[actor_id]
 		var outcome: Dictionary = resolution.outcome_for(actor_id)
@@ -910,6 +1117,8 @@ func _actor_color(actor_id: StringName) -> Color:
 func _intent_text(intent) -> String:
 	if intent.action_type == TurnIntentType.ActionType.WAIT:
 		return "等待"
+	if intent.action_type == TurnIntentType.ActionType.USE_SKILL:
+		return "使用包扎" if intent.skill_id == SKILL_BANDAGE else "使用技能"
 	match intent.delta:
 		Vector2i.UP:
 			return "向上"
@@ -928,6 +1137,10 @@ func _reason_text(reason: StringName) -> String:
 			return "已移动"
 		&"waited":
 			return "主动等待"
+		&"used_grid_skill":
+			return "技能已结算"
+		&"unknown_grid_skill", &"invalid_skill_source", &"grid_skill_already_used":
+			return "技能使用失败"
 		&"blocked_by_terrain":
 			return "地形阻挡"
 		&"out_of_bounds":

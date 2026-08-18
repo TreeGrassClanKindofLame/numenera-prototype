@@ -1,5 +1,11 @@
 extends RefCounted
 
+const SquadUnitStateType = preload("res://scripts/model/squad_unit_state.gd")
+
+const SKILL_COMBO := &"combo"
+const PASSIVE_BLOODIED := &"bloodied"
+const COMBO_TP_COST := 4
+
 
 static func resolve_round(
 	first_squad,
@@ -71,71 +77,33 @@ static func _resolve_turns(
 		var acting_squad = first_squad if turn["squad_id"] == first_squad.actor_id else second_squad
 		var defending_squad = second_squad if acting_squad == first_squad else first_squad
 		var attacker = acting_squad.unit_by_id(turn["unit_id"])
-		var schedule_entry := turn.duplicate(true)
-		var schedule_index: int = result["turn_schedule"].size()
-		schedule_entry["schedule_index"] = schedule_index
-		schedule_entry["phase"] = phase
-		schedule_entry["phase_index"] = phase_index
-		schedule_entry["status"] = &"pending"
-		schedule_entry["skipped_reason"] = &""
-		schedule_entry["event_index"] = -1
 		if attacker == null or not attacker.is_alive():
-			schedule_entry["status"] = &"skipped"
-			schedule_entry["skipped_reason"] = &"actor_dead"
-			result["turn_schedule"].append(schedule_entry)
+			_append_skipped_action(result, turn, phase, phase_index, &"normal_attack", &"", &"actor_dead")
 			continue
 		if not defending_squad.is_alive():
-			schedule_entry["status"] = &"skipped"
-			schedule_entry["skipped_reason"] = &"no_living_enemy"
-			result["turn_schedule"].append(schedule_entry)
+			_append_skipped_action(result, turn, phase, phase_index, &"normal_attack", &"", &"no_living_enemy")
 			continue
-		var target_info := _choose_target(attacker, defending_squad, rng)
-		var target = target_info["target"]
-		if target == null:
-			schedule_entry["status"] = &"skipped"
-			schedule_entry["skipped_reason"] = &"no_valid_target"
-			result["turn_schedule"].append(schedule_entry)
+
+		if (
+			attacker.unit_class == SquadUnitStateType.CLASS_WARRIOR
+			and attacker.can_spend_resource(SquadUnitStateType.RESOURCE_TP, COMBO_TP_COST)
+		):
+			var combo_formations_before := formation_snapshot(first_squad, second_squad)
+			var combo_tp_before: int = attacker.resource_value(SquadUnitStateType.RESOURCE_TP)
+			attacker.spend_resource(SquadUnitStateType.RESOURCE_TP, COMBO_TP_COST)
+			_resolve_attack(
+				result, turn, phase, phase_index, &"combo_attack", SKILL_COMBO,
+				acting_squad, defending_squad, attacker, first_squad, second_squad, rng,
+				combo_formations_before, combo_tp_before, COMBO_TP_COST
+			)
+
+		if not defending_squad.is_alive():
+			_append_skipped_action(result, turn, phase, phase_index, &"normal_attack", &"", &"no_living_enemy")
 			continue
-		var health_before: int = target.health
-		var squad_health_before: int = defending_squad.health
-		var formations_before := formation_snapshot(first_squad, second_squad)
-		target.health -= attacker.attack
-		defending_squad.sync_summary_stats()
-		var event_index: int = result["events"].size()
-		var event := {
-			"schedule_index": schedule_index,
-			"phase": phase,
-			"phase_index": phase_index,
-			"attacker_squad_id": acting_squad.actor_id,
-			"defender_squad_id": defending_squad.actor_id,
-			"attacker_unit_id": attacker.unit_id,
-			"defender_unit_id": target.unit_id,
-			"attacker_class": attacker.unit_class,
-			"defender_class": target.unit_class,
-			"attacker_slot": attacker.slot,
-			"defender_slot": target.slot,
-			"speed": attacker.speed,
-			"damage": attacker.attack,
-			"health_before": health_before,
-			"health_after": target.health,
-			"defender_squad_health_before": squad_health_before,
-			"defender_squad_health_after": defending_squad.health,
-			"target_died": not target.is_alive(),
-			"preferred_row": attacker.preferred_row(),
-			"selected_row": target_info["selected_row"],
-			"used_fallback_row": target_info["used_fallback_row"],
-			"used_random_tie": target_info["used_random_tie"],
-			"candidate_unit_ids": target_info["candidate_unit_ids"],
-			"target_rule": target_info["target_rule"],
-			"target_distance": target_info["target_distance"],
-			"formations_before": formations_before,
-			"formations_after": formation_snapshot(first_squad, second_squad),
-		}
-		result["events"].append(event)
-		result["action_order"].append([acting_squad.actor_id, attacker.unit_id])
-		schedule_entry["status"] = &"acted"
-		schedule_entry["event_index"] = event_index
-		result["turn_schedule"].append(schedule_entry)
+		_resolve_attack(
+			result, turn, phase, phase_index, &"normal_attack", &"",
+			acting_squad, defending_squad, attacker, first_squad, second_squad, rng
+		)
 	result["combat_phases"].append({
 		"phase": phase,
 		"schedule_start": schedule_start,
@@ -143,6 +111,139 @@ static func _resolve_turns(
 		"event_start": event_start,
 		"event_count": result["events"].size() - event_start,
 	})
+
+
+static func _resolve_attack(
+	result: Dictionary,
+	turn: Dictionary,
+	phase: StringName,
+	phase_index: int,
+	action_kind: StringName,
+	skill_id: StringName,
+	acting_squad,
+	defending_squad,
+	attacker,
+	first_squad,
+	second_squad,
+	rng: RandomNumberGenerator,
+	formations_before_override: Dictionary = {},
+	resource_before_override: int = -1,
+	resource_spent: int = 0
+) -> void:
+	var schedule_entry := _schedule_entry(turn, phase, phase_index, action_kind, skill_id)
+	var schedule_index: int = result["turn_schedule"].size()
+	schedule_entry["schedule_index"] = schedule_index
+	var target_info := _choose_target(attacker, defending_squad, rng)
+	var target = target_info["target"]
+	if target == null:
+		schedule_entry["status"] = &"skipped"
+		schedule_entry["skipped_reason"] = &"no_valid_target"
+		result["turn_schedule"].append(schedule_entry)
+		return
+
+	var health_before: int = target.health
+	var squad_health_before: int = defending_squad.health
+	var formations_before := (
+		formation_snapshot(first_squad, second_squad)
+		if formations_before_override.is_empty()
+		else formations_before_override
+	)
+	var tp_before: int = (
+		attacker.resource_value(SquadUnitStateType.RESOURCE_TP)
+		if resource_before_override < 0
+		else resource_before_override
+	)
+	var damage_bonus := 0
+	var passive_ids: Array = []
+	if (
+		attacker.unit_class == SquadUnitStateType.CLASS_WARRIOR
+		and attacker.health * 2 < attacker.max_health
+	):
+		damage_bonus = 1
+		passive_ids.append(PASSIVE_BLOODIED)
+	var damage: int = attacker.attack + damage_bonus
+	target.health -= damage
+	defending_squad.sync_summary_stats()
+	var tp_gained: int = attacker.gain_resource(SquadUnitStateType.RESOURCE_TP, 1)
+	var event_index: int = result["events"].size()
+	var event := {
+		"schedule_index": schedule_index,
+		"phase": phase,
+		"phase_index": phase_index,
+		"action_kind": action_kind,
+		"skill_id": skill_id,
+		"passive_ids": passive_ids,
+		"attacker_squad_id": acting_squad.actor_id,
+		"defender_squad_id": defending_squad.actor_id,
+		"attacker_unit_id": attacker.unit_id,
+		"defender_unit_id": target.unit_id,
+		"attacker_class": attacker.unit_class,
+		"defender_class": target.unit_class,
+		"attacker_slot": attacker.slot,
+		"defender_slot": target.slot,
+		"speed": attacker.speed,
+		"base_damage": attacker.attack,
+		"damage_bonus": damage_bonus,
+		"damage": damage,
+		"health_before": health_before,
+		"health_after": target.health,
+		"defender_squad_health_before": squad_health_before,
+		"defender_squad_health_after": defending_squad.health,
+		"target_died": not target.is_alive(),
+		"resource_id": SquadUnitStateType.RESOURCE_TP if attacker.has_resource(SquadUnitStateType.RESOURCE_TP) else &"",
+		"resource_before": tp_before,
+		"resource_spent": resource_spent,
+		"resource_gained": tp_gained,
+		"resource_after": attacker.resource_value(SquadUnitStateType.RESOURCE_TP),
+		"preferred_row": attacker.preferred_row(),
+		"selected_row": target_info["selected_row"],
+		"used_fallback_row": target_info["used_fallback_row"],
+		"used_random_tie": target_info["used_random_tie"],
+		"candidate_unit_ids": target_info["candidate_unit_ids"],
+		"target_rule": target_info["target_rule"],
+		"target_distance": target_info["target_distance"],
+		"formations_before": formations_before,
+		"formations_after": formation_snapshot(first_squad, second_squad),
+	}
+	result["events"].append(event)
+	result["action_order"].append([acting_squad.actor_id, attacker.unit_id])
+	schedule_entry["status"] = &"acted"
+	schedule_entry["event_index"] = event_index
+	result["turn_schedule"].append(schedule_entry)
+
+
+static func _append_skipped_action(
+	result: Dictionary,
+	turn: Dictionary,
+	phase: StringName,
+	phase_index: int,
+	action_kind: StringName,
+	skill_id: StringName,
+	reason: StringName
+) -> void:
+	var entry := _schedule_entry(turn, phase, phase_index, action_kind, skill_id)
+	entry["schedule_index"] = result["turn_schedule"].size()
+	entry["status"] = &"skipped"
+	entry["skipped_reason"] = reason
+	result["turn_schedule"].append(entry)
+
+
+static func _schedule_entry(
+	turn: Dictionary,
+	phase: StringName,
+	phase_index: int,
+	action_kind: StringName,
+	skill_id: StringName
+) -> Dictionary:
+	var entry := turn.duplicate(true)
+	entry["phase"] = phase
+	entry["phase_index"] = phase_index
+	entry["action_kind"] = action_kind
+	entry["skill_id"] = skill_id
+	entry["status"] = &"pending"
+	entry["skipped_reason"] = &""
+	entry["event_index"] = -1
+	return entry
 
 
 static func _build_round_zero_order(
@@ -202,7 +303,7 @@ static func formation_snapshot(first_squad, second_squad) -> Dictionary:
 static func _unit_snapshot(squad) -> Array:
 	var snapshot: Array = []
 	for unit in squad.units:
-		snapshot.append({
+			snapshot.append({
 			"unit_id": unit.unit_id,
 			"unit_class": unit.unit_class,
 			"slot": unit.slot,
@@ -210,6 +311,7 @@ static func _unit_snapshot(squad) -> Array:
 			"max_health": unit.max_health,
 			"attack": unit.attack,
 			"speed": unit.speed,
+			"resources": unit.resources.duplicate(true),
 			"alive": unit.is_alive(),
 		})
 	return snapshot

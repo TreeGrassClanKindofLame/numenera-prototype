@@ -20,6 +20,10 @@ func _ready() -> void:
 
 func _run_all() -> void:
 	_test_class_stats_and_free_formation()
+	_test_class_resources_and_clone()
+	_test_tp_combo_and_bloodied_rules()
+	_test_bandage_grid_skill_rules()
+	_test_battle_hardened_third_encounter_once()
 	_test_front_and_back_row_preferences()
 	_test_empty_preferred_row_falls_back()
 	_test_facing_column_then_nearest_column()
@@ -55,7 +59,7 @@ func _run_all() -> void:
 	await get_tree().create_timer(0.15).timeout
 
 	if _failures == 0:
-		print("PASS: %d checks across 31 squad-combat scenarios." % _checks)
+		print("PASS: %d checks across 35 squad-combat scenarios." % _checks)
 		get_tree().quit(0)
 	else:
 		push_error("FAIL: %d of %d checks failed." % [_failures, _checks])
@@ -77,6 +81,153 @@ func _test_class_stats_and_free_formation() -> void:
 	_expect_true(not squad.set_unit_at(Vector2i(1, 1), &"tank"), "fifth unit is rejected")
 	squad.set_unit_at(Vector2i(0, 1), &"")
 	_expect_true(squad.set_unit_at(Vector2i(1, 1), &"tank"), "duplicate class is allowed after freeing a slot")
+
+
+func _test_class_resources_and_clone() -> void:
+	var tank = SquadUnitStateType.create_for_class(&"tank", &"tank", Vector2i.ZERO)
+	var warrior = SquadUnitStateType.create_for_class(&"warrior", &"warrior", Vector2i.ZERO)
+	var archer = SquadUnitStateType.create_for_class(&"archer", &"archer", Vector2i.ZERO)
+	var assassin = SquadUnitStateType.create_for_class(&"assassin", &"assassin", Vector2i.ZERO)
+	var custom = SquadUnitStateType.create_for_class(&"custom", &"custom", Vector2i.ZERO)
+	_expect_equal([tank.resource_value(&"tp"), tank.resource_max(&"tp")], [0, 5], "tank starts with empty five-point TP")
+	_expect_equal([warrior.resource_value(&"tp"), warrior.resource_max(&"tp")], [0, 5], "warrior starts with empty five-point TP")
+	_expect_equal([archer.resource_value(&"mp"), archer.resource_max(&"mp")], [5, 5], "archer starts with full five-point MP")
+	_expect_equal([assassin.resource_value(&"mp"), assassin.resource_max(&"mp")], [5, 5], "assassin starts with full five-point MP")
+	_expect_true(custom.resources.is_empty(), "unclassed custom unit has no extra resource")
+	warrior.gain_resource(&"tp", 99)
+	_expect_equal(warrior.resource_value(&"tp"), 5, "resource gain clamps at maximum")
+	var clone = warrior.clone()
+	clone.spend_resource(&"tp", 3)
+	_expect_equal(clone.resource_value(&"tp"), 2, "cloned unit can spend its own resource")
+	_expect_equal(warrior.resource_value(&"tp"), 5, "unit clone deep-copies resource state")
+	var tank_squad = _squad(&"tank_squad", &"player", &"player", Vector2i.ZERO, [tank])
+	var training_target = _squad(&"training", &"enemy", &"npc", Vector2i.ZERO, [
+		_unit(&"training_u", &"custom", 1, 0, 20, 0, 1),
+	])
+	_battle(tank_squad, training_target, 70)
+	_expect_equal(tank_squad.unit_by_id(&"tank").resource_value(&"tp"), 1, "tank gains TP after a normal attack")
+	_expect_true(SquadBattleResolverType.formation_snapshot(tank_squad, training_target)[&"tank_squad"][0]["resources"].has(&"tp"), "formation snapshots include resources")
+
+
+func _test_tp_combo_and_bloodied_rules() -> void:
+	var warrior_unit = _unit(&"w", &"warrior", 1, 0, 10, 2, 5)
+	warrior_unit.health = 4
+	warrior_unit.gain_resource(&"tp", 4)
+	var warriors = _squad(&"player", &"player", &"player", Vector2i.ZERO, [warrior_unit])
+	var target = _squad(&"enemy", &"enemy", &"npc", Vector2i.ZERO, [
+		_unit(&"target", &"custom", 1, 0, 30, 0, 1),
+	])
+	var result := _battle(warriors, target, 71)
+	var warrior_attacks: Array = []
+	for event: Dictionary in result["events"]:
+		if event["attacker_unit_id"] == &"w":
+			warrior_attacks.append(event)
+	_expect_equal(warrior_attacks.size(), 2, "four TP triggers exactly one extra attack in a scheduled turn")
+	_expect_equal(warrior_attacks[0]["action_kind"], &"combo_attack", "combo attack resolves before the planned attack")
+	_expect_equal([warrior_attacks[0]["damage"], warrior_attacks[1]["damage"]], [3, 3], "bloodied adds damage to combo and normal attacks")
+	_expect_equal(warriors.unit_by_id(&"w").resource_value(&"tp"), 2, "combo spends four TP and both attacks recharge one")
+
+	var repeated_unit = _unit(&"rw", &"warrior", 1, 0, 20, 1, 5)
+	repeated_unit.gain_resource(&"tp", 5)
+	var repeated = _squad(&"player", &"player", &"player", Vector2i.ZERO, [repeated_unit])
+	var durable = _squad(&"enemy", &"enemy", &"npc", Vector2i.ZERO, [
+		_unit(&"durable", &"custom", 1, 0, 50, 0, 1),
+	])
+	var repeated_result := _battle(repeated, durable, 72, 1, 0)
+	var combo_count := 0
+	for event: Dictionary in repeated_result["events"]:
+		if event["attacker_unit_id"] == &"rw" and event["action_kind"] == &"combo_attack":
+			combo_count += 1
+	_expect_equal(combo_count, 1, "four-point combo cannot retrigger in round one after a round-zero combo")
+	_expect_equal(repeated.unit_by_id(&"rw").resource_value(&"tp"), 4, "one combo and three attacks leave the expected TP")
+
+	var half_unit = _unit(&"half", &"warrior", 1, 0, 4, 2, 5)
+	half_unit.health = 2
+	var half = _squad(&"half_squad", &"player", &"player", Vector2i.ZERO, [half_unit])
+	var half_target = _squad(&"half_enemy", &"enemy", &"npc", Vector2i.ZERO, [
+		_unit(&"half_target", &"custom", 1, 0, 20, 0, 1),
+	])
+	_expect_equal(_battle(half, half_target, 73)["events"][0]["damage"], 2, "exactly fifty percent health does not trigger bloodied")
+
+
+func _test_bandage_grid_skill_rules() -> void:
+	var source = _unit(&"source", &"warrior", 1, 0, 5, 2, 2)
+	var wounded = _unit(&"wounded", &"tank", 2, 0, 8, 1, 1)
+	wounded.health = 4
+	var dead = _unit(&"dead", &"archer", 1, 1, 3, 3, 2)
+	dead.health = 0
+	var squad = _squad(&"player", &"player", &"player", Vector2i(1, 1), [source, wounded, dead])
+	var resolution = _resolve(Vector2i(5, 4), [], [squad], {
+		&"player": _skill(&"player", &"bandage", &"source"),
+	})
+	var healed = resolution.actor_state_for(&"player")
+	_expect_equal(healed.unit_by_id(&"source").resource_value(&"tp"), 0, "bandage does not require or consume TP")
+	_expect_equal(healed.unit_by_id(&"wounded").health, 6, "bandage heals each living wounded unit by two")
+	_expect_equal(healed.unit_by_id(&"dead").health, 0, "bandage does not revive dead units")
+	_expect_equal(resolution.grid_skill_events[0]["status"], &"resolved", "bandage resolves after a peaceful grid turn")
+	_expect_true(healed.map_passive_state.get(&"bandage_used", false), "bandage consumes the squad's once-per-map use immediately")
+	var repeated_cast = _resolve(Vector2i(5, 4), [], [healed], {
+		&"player": _skill(&"player", &"bandage", &"source"),
+	})
+	_expect_equal(repeated_cast.movement_results[&"player"]["reason"], &"grid_skill_already_used", "second bandage attempt on the same map is rejected")
+	_expect_true(repeated_cast.grid_skill_events.is_empty(), "rejected repeat bandage creates no healing event")
+	var full_source = _unit(&"full_source", &"warrior", 1, 0, 5, 2, 2)
+	var full_squad = _squad(&"full", &"player", &"player", Vector2i(1, 1), [full_source])
+	var empty_cast = _resolve(Vector2i(5, 4), [], [full_squad], {
+		&"full": _skill(&"full", &"bandage", &"full_source"),
+	})
+	_expect_equal(empty_cast.grid_skill_events[0]["heals"][0]["amount"], 0, "bandage may be spent while every living unit is at full health")
+	_expect_true(empty_cast.actor_state_for(&"full").map_passive_state.get(&"bandage_used", false), "empty bandage still consumes the map use")
+
+	var doomed = _unit(&"doomed", &"warrior", 1, 0, 3, 1, 1)
+	var survivor = _unit(&"survivor", &"tank", 2, 0, 8, 0, 1)
+	survivor.health = 4
+	var player = _squad(&"player", &"player", &"player", Vector2i(1, 1), [doomed, survivor], Vector2i.RIGHT)
+	var enemy = _squad(&"enemy", &"enemy", &"npc", Vector2i(2, 1), [
+		_unit(&"killer", &"custom", 1, 0, 20, 5, 3),
+	], Vector2i.LEFT)
+	var lethal = _resolve(Vector2i(5, 4), [], [player, enemy], {
+		&"player": _skill(&"player", &"bandage", &"doomed"),
+		&"enemy": _move(&"enemy", Vector2i.LEFT),
+	}, 74)
+	_expect_equal(lethal.grid_skill_events[0]["status"], &"source_dead", "bandage fails after its chosen warrior dies")
+	_expect_equal(lethal.actor_state_for(&"player").unit_by_id(&"survivor").health, 4, "failed bandage does not fall back to another warrior")
+
+
+func _test_battle_hardened_third_encounter_once() -> void:
+	var player = _squad(&"player", &"player", &"player", Vector2i(1, 1), [
+		_unit(&"pw", &"warrior", 1, 0, 50, 0, 2),
+	], Vector2i.RIGHT)
+	var enemy = _squad(&"enemy", &"enemy", &"npc", Vector2i(2, 1), [
+		_unit(&"ew", &"warrior", 1, 0, 50, 0, 1),
+	], Vector2i.LEFT)
+	var class_advantages: Array = []
+	for turn_index in 4:
+		var resolution = _resolve(Vector2i(5, 4), [], [player, enemy], {
+			&"player": _move(&"player", Vector2i.RIGHT),
+			&"enemy": _wait(&"enemy"),
+		}, 80 + turn_index)
+		var encounter: Dictionary = resolution.collision_waves[0]["groups"][0]["encounters"][0]
+		class_advantages.append([
+			encounter["engagement"].get("first_class_advantage", 0),
+			encounter["engagement"].get("second_class_advantage", 0),
+		])
+		player = resolution.actor_state_for(&"player")
+		enemy = resolution.actor_state_for(&"enemy")
+	_expect_equal(class_advantages, [[0, 0], [0, 0], [1, 1], [0, 0]], "battle hardened grants both squads one advantage only on their third encounter")
+	_expect_true(player.map_passive_state.get(&"battle_hardened_used", false), "battle hardened remains consumed for the map")
+	var dead_warrior = _unit(&"dead_w", &"warrior", 0, 0, 5, 0, 1)
+	dead_warrior.health = 0
+	var no_source = _squad(&"no_source", &"player", &"player", Vector2i(1, 1), [
+		dead_warrior, _unit(&"living", &"custom", 1, 0, 20, 0, 1),
+	])
+	var other = _squad(&"other", &"enemy", &"npc", Vector2i(2, 1), [
+		_unit(&"other_u", &"custom", 1, 0, 20, 0, 1),
+	])
+	var no_source_result = _resolve(Vector2i(5, 4), [], [no_source, other], {
+		&"no_source": _move(&"no_source", Vector2i.RIGHT), &"other": _wait(&"other"),
+	}, 85)
+	_expect_equal(no_source_result.actor_state_for(&"no_source").map_passive_state.get(&"battle_hardened_count", 0), 0, "dead warriors do not advance battle hardened")
 
 
 func _test_front_and_back_row_preferences() -> void:
@@ -656,11 +807,26 @@ func _test_main_scene_gm_panel_and_combat() -> void:
 	_expect_equal(main._actors[&"dummy"].attack, 0, "dummy squad cannot damage the player")
 	_expect_equal(main._actors[&"dummy"].health, 200, "dummy squad has durable test health")
 	_expect_equal(main._formation_labels.size(), 6, "GM panel exposes all 2x3 slots")
+	_expect_true(main._formation_resource_bars[Vector2i(0, 0)].visible, "grid formation panel shows a resource bar for a tank")
+	_expect_equal(main._formation_resource_bars[Vector2i(0, 0)].max_value, 5.0, "grid resource bar uses the class maximum")
+	_expect_true(not main._bandage_button.disabled, "bandage starts available while the squad has a living warrior")
 	main._selected_squad_id = &"player"
 	var original_class: StringName = main._actors[&"player"].unit_at(Vector2i(0, 0)).unit_class
 	main._cycle_formation_slot(Vector2i(0, 0))
 	_expect_true(main._actors[&"player"].unit_at(Vector2i(0, 0)).unit_class != original_class, "GM slot cycles class before movement")
 	_expect_true(main._formation_labels[Vector2i(0, 0)].text.contains("HP"), "GM panel shows full unit attributes")
+	var bandage_target = main._actors[&"player"].unit_at(Vector2i(0, 0))
+	bandage_target.health -= 2
+	main._actors[&"player"].sync_summary_stats()
+	main._refresh_formation_panel()
+	_expect_true(not main._bandage_button.disabled, "bandage button remains enabled without TP")
+	main._on_bandage_pressed()
+	_expect_true(main._bandage_targeting, "bandage button enters source-selection mode")
+	main._cycle_formation_slot(Vector2i(1, 0))
+	await get_tree().create_timer(0.4).timeout
+	_expect_true(not main._busy, "selected bandage source completes a grid skill turn")
+	_expect_equal(main._actors[&"player"].unit_at(Vector2i(0, 0)).health, bandage_target.max_health, "grid bandage interaction heals the selected squad")
+	_expect_true(main._bandage_button.disabled, "bandage button disables after the map use is spent")
 	await main._play_turn(_move(&"player", Vector2i.RIGHT))
 	await main._play_turn(_move(&"player", Vector2i.DOWN))
 	await main._play_turn(_move(&"player", Vector2i.RIGHT))
@@ -669,9 +835,7 @@ func _test_main_scene_gm_panel_and_combat() -> void:
 	_expect_equal(main._actors[&"dummy"].facing, Vector2i.DOWN, "dummy keeps its initial downward facing")
 	_expect_true(not main._battle_overlay.visible, "battle overlay closes after complete presentation")
 	_expect_true(not main._busy, "input unlocks after squad battle animation")
-	var preview := get_viewport().get_texture().get_image()
-	_expect_true(not preview.is_empty(), "squad prototype renders a viewport")
-	_expect_equal(preview.save_png(ProjectSettings.globalize_path("res://.godot/test_preview.png")), OK, "squad preview can be captured")
+	_capture_viewport("res://.godot/test_preview.png", "squad preview can be captured")
 	main.queue_free()
 	await get_tree().process_frame
 
@@ -692,8 +856,7 @@ func _test_enemy_scenario_switching_and_debug() -> void:
 		robot_classes.append(unit.unit_class)
 	_expect_equal(robot_classes.count(&"tank"), 2, "robot formation contains two tanks")
 	_expect_equal(robot_classes.count(&"archer"), 2, "robot formation contains two archers")
-	var robot_preview := get_viewport().get_texture().get_image()
-	_expect_equal(robot_preview.save_png(ProjectSettings.globalize_path("res://.godot/robot_scenario_preview.png")), OK, "robot debug scenario can be captured")
+	_capture_viewport("res://.godot/robot_scenario_preview.png", "robot debug scenario can be captured")
 	await main._play_turn(_wait(&"player"))
 	_expect_equal(main._actors[&"robot"].cell, Vector2i(7, 2), "robot moves clockwise on scenario turn one")
 	await main._play_turn(_wait(&"player"))
@@ -707,8 +870,7 @@ func _test_enemy_scenario_switching_and_debug() -> void:
 		bandit_classes.append(unit.unit_class)
 	_expect_equal(bandit_classes.count(&"warrior"), 2, "bandit formation contains two warriors")
 	_expect_equal(bandit_classes.count(&"assassin"), 2, "bandit formation contains two assassins")
-	var bandit_preview := get_viewport().get_texture().get_image()
-	_expect_equal(bandit_preview.save_png(ProjectSettings.globalize_path("res://.godot/bandit_scenario_preview.png")), OK, "bandit vision scenario can be captured")
+	_capture_viewport("res://.godot/bandit_scenario_preview.png", "bandit vision scenario can be captured")
 	main._ai_debug_toggle.button_pressed = false
 	main._switch_scenario(ScenarioCatalogType.SCENARIO_DUMMY)
 	await get_tree().process_frame
@@ -738,8 +900,7 @@ func _test_focused_stage_auto_playback() -> void:
 	_expect_true(main._battle_overlay.visible, "focused battle stage stays visible during encounter")
 	_expect_true(main._battle_overlay.headline.contains("同步冲突点 1/2"), "stage identifies sequential replay inside simultaneous wave")
 	_expect_true(not main._waiting_for_combat_step, "automatic playback never waits for space")
-	var stage_preview := get_viewport().get_texture().get_image()
-	_expect_equal(stage_preview.save_png(ProjectSettings.globalize_path("res://.godot/focused_stage_preview.png")), OK, "focused battle stage can be captured")
+	_capture_viewport("res://.godot/focused_stage_preview.png", "focused battle stage can be captured")
 	await get_tree().create_timer(main.COMBAT_EVENT_DURATION * 3.0 + main.RESULT_HOLD_DURATION).timeout
 	_expect_equal(main._battle_overlay.mode, &"result", "automatic encounter reaches persistent result state before caller closes it")
 	main._battle_overlay.end_encounter()
@@ -821,6 +982,21 @@ func _move(id: StringName, delta: Vector2i):
 
 func _wait(id: StringName):
 	return TurnIntentType.new(id, TurnIntentType.ActionType.WAIT, Vector2i.ZERO)
+
+
+func _skill(id: StringName, skill_id: StringName, source_unit_id: StringName):
+	return TurnIntentType.new(
+		id, TurnIntentType.ActionType.USE_SKILL, Vector2i.ZERO, skill_id, source_unit_id
+	)
+
+
+func _capture_viewport(path: String, message: String) -> void:
+	if DisplayServer.get_name() == "headless":
+		return
+	var preview := get_viewport().get_texture().get_image()
+	_expect_true(preview != null and not preview.is_empty(), message)
+	if preview != null and not preview.is_empty():
+		_expect_equal(preview.save_png(ProjectSettings.globalize_path(path)), OK, message)
 
 
 func _expect_true(condition: bool, message: String) -> void:

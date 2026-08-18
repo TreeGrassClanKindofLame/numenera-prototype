@@ -75,11 +75,14 @@ func preview_action(schedule_entry: Dictionary, event: Dictionary) -> void:
 	impact_flash = 0.0
 	target_died = event.get("target_died", false)
 	var phase_text := "第零回合" if event.get("phase", &"round_one") == &"round_zero" else "第一回合"
+	var action_name := "连击" if event.get("action_kind", &"normal_attack") == &"combo_attack" else "普通攻击"
+	if event.get("passive_ids", []).has(&"bloodied"):
+		action_name += "＋浴血"
 	var action_text: String = _target_reason_text(event) if slow_motion else "%s 准备攻击 %s" % [
 		_unit_display_name(attacker_squad_id, attacker_unit_id),
 		_unit_display_name(defender_squad_id, defender_unit_id),
 	]
-	detail_text = "%s｜%s" % [phase_text, action_text]
+	detail_text = "%s｜%s｜%s" % [phase_text, action_name, action_text]
 	mode = &"battle"
 	queue_redraw()
 
@@ -104,10 +107,21 @@ func commit_action(event: Dictionary) -> void:
 	attack_progress = 0.0
 	damage_progress = 1.0
 	impact_flash = 0.0
-	detail_text = "%s 造成 %d 点伤害%s" % [
+	var damage_text := "%d" % event.get("damage", 0)
+	if event.get("damage_bonus", 0) > 0:
+		damage_text += "（基础%d＋浴血%d）" % [
+			event.get("base_damage", 0), event.get("damage_bonus", 0)
+		]
+	var resource_text := ""
+	if event.get("resource_id", &"") != &"":
+		resource_text = "｜TP %d→%d" % [
+			event.get("resource_before", 0), event.get("resource_after", 0)
+		]
+	detail_text = "%s 造成 %s 点伤害%s%s" % [
 		_unit_display_name(event.get("attacker_squad_id", &""), event.get("attacker_unit_id", &"")),
-		event.get("damage", 0),
+		damage_text,
 		"，目标阵亡" if event.get("target_died", false) else "",
+		resource_text,
 	]
 	queue_redraw()
 
@@ -258,10 +272,27 @@ func _draw_unit_card(squad_id: StringName, unit: Dictionary, rect: Rect2) -> voi
 		health_value = lerpf(active_event.get("health_before", health_value), active_event.get("health_after", health_value), damage_progress)
 	var max_health: float = maxf(unit.get("max_health", 1), 1.0)
 	var health_ratio := clampf(health_value / max_health, 0.0, 1.0)
-	var bar_rect := Rect2(card_rect.position + Vector2(8.0, 58.0), Vector2(card_rect.size.x - 16.0, 12.0))
+	var resources: Dictionary = unit.get("resources", {})
+	var has_resource := resources.has(SquadUnitStateType.RESOURCE_TP) or resources.has(SquadUnitStateType.RESOURCE_MP)
+	var bar_rect := Rect2(card_rect.position + Vector2(8.0, 56.0), Vector2(card_rect.size.x - 16.0, 9.0 if has_resource else 12.0))
 	draw_rect(bar_rect, Color("281d25"), true)
 	draw_rect(Rect2(bar_rect.position, Vector2(bar_rect.size.x * health_ratio, bar_rect.size.y)), Color("55c97a") if health_ratio > 0.35 else Color("e05b5b"), true)
-	draw_string(ThemeDB.fallback_font, card_rect.position + Vector2(8.0, 88.0), "HP %d/%d" % [maxi(roundi(health_value), 0), roundi(max_health)], HORIZONTAL_ALIGNMENT_LEFT, card_rect.size.x - 16.0, 12, Color.WHITE)
+	if has_resource:
+		draw_string(ThemeDB.fallback_font, card_rect.position + Vector2(8.0, 76.0), "HP %d/%d" % [maxi(roundi(health_value), 0), roundi(max_health)], HORIZONTAL_ALIGNMENT_LEFT, 62.0, 11, Color.WHITE)
+		var resource_id: StringName = SquadUnitStateType.RESOURCE_TP if resources.has(SquadUnitStateType.RESOURCE_TP) else SquadUnitStateType.RESOURCE_MP
+		var resource: Dictionary = resources[resource_id]
+		var resource_max: float = maxf(resource.get("max", 1), 1.0)
+		var resource_value: float = resource.get("current", 0)
+		var resource_rect := Rect2(card_rect.position + Vector2(8.0, 80.0), Vector2(card_rect.size.x - 16.0, 7.0))
+		draw_rect(resource_rect, Color("192331"), true)
+		draw_rect(
+			Rect2(resource_rect.position, Vector2(resource_rect.size.x * clampf(resource_value / resource_max, 0.0, 1.0), resource_rect.size.y)),
+			Color("e4a64f") if resource_id == SquadUnitStateType.RESOURCE_TP else Color("558ee6"),
+			true
+		)
+		draw_string(ThemeDB.fallback_font, card_rect.position + Vector2(76.0, 76.0), "%s %d/%d" % [String(resource_id).to_upper(), roundi(resource_value), roundi(resource_max)], HORIZONTAL_ALIGNMENT_RIGHT, card_rect.size.x - 84.0, 11, Color.WHITE)
+	else:
+		draw_string(ThemeDB.fallback_font, card_rect.position + Vector2(8.0, 88.0), "HP %d/%d" % [maxi(roundi(health_value), 0), roundi(max_health)], HORIZONTAL_ALIGNMENT_LEFT, card_rect.size.x - 16.0, 12, Color.WHITE)
 	if not alive:
 		draw_rect(card_rect, Color(0.05, 0.05, 0.06, 0.48), true)
 		draw_string(ThemeDB.fallback_font, card_rect.position + Vector2(0.0, 57.0), "阵亡", HORIZONTAL_ALIGNMENT_CENTER, card_rect.size.x, 18, Color("ff8a8a"))
@@ -286,7 +317,12 @@ func _draw_attack_connection() -> void:
 
 func _draw_action_queue() -> void:
 	var y := 164.0
-	for index in schedule.size():
+	const VISIBLE_ACTIONS := 9
+	var first_visible := 0
+	if schedule.size() > VISIBLE_ACTIONS:
+		first_visible = clampi(current_schedule_index - int(VISIBLE_ACTIONS / 2), 0, schedule.size() - VISIBLE_ACTIONS)
+	var last_visible := mini(first_visible + VISIBLE_ACTIONS, schedule.size())
+	for index in range(first_visible, last_visible):
 		var entry: Dictionary = schedule[index]
 		var rect := Rect2(904.0, y, 218.0, 40.0)
 		var state := &"pending"
@@ -309,7 +345,8 @@ func _draw_action_queue() -> void:
 		draw_rect(rect, Color("3b516b"), false, 1.0)
 		var prefix := "▶" if state == &"current" else "×" if state == &"skipped" else "✓" if state == &"acted" else "%d" % (index + 1)
 		var phase_mark := "零" if entry.get("phase", &"round_one") == &"round_zero" else "一"
-		var label := "%s[%s] %s　速%d" % [prefix, phase_mark, _unit_display_name(entry.get("squad_id", &""), entry.get("unit_id", &"")), entry.get("speed", 0)]
+		var action_mark := "连" if entry.get("action_kind", &"normal_attack") == &"combo_attack" else "攻"
+		var label := "%s[%s·%s] %s　速%d" % [prefix, phase_mark, action_mark, _unit_display_name(entry.get("squad_id", &""), entry.get("unit_id", &"")), entry.get("speed", 0)]
 		draw_string(ThemeDB.fallback_font, rect.position + Vector2(8.0, 17.0), label, HORIZONTAL_ALIGNMENT_LEFT, 202.0, 12, text_color)
 		if state == &"skipped":
 			draw_string(ThemeDB.fallback_font, rect.position + Vector2(8.0, 34.0), _skip_reason_text(entry.get("skipped_reason", &"")), HORIZONTAL_ALIGNMENT_LEFT, 202.0, 10, text_color)
@@ -381,15 +418,20 @@ func _engagement_summary() -> String:
 	var second_contact: Dictionary = data.get("second_contact", {})
 	var first_id: StringName = encounter.get("first_squad_id", &"")
 	var second_id: StringName = encounter.get("second_squad_id", &"")
-	var verdict := "均无优势"
-	if encounter.get("first_advantage", 0) > 0:
-		verdict = "%s 获得%d点优势" % [
-			_squad_display_name(first_id), encounter.get("first_advantage", 0)
-		]
-	elif encounter.get("second_advantage", 0) > 0:
-		verdict = "%s 获得%d点优势" % [
-			_squad_display_name(second_id), encounter.get("second_advantage", 0)
-		]
+	var advantage_parts: Array = []
+	for spec: Array in [
+		[first_id, "first", encounter.get("first_advantage", 0)],
+		[second_id, "second", encounter.get("second_advantage", 0)],
+	]:
+		var total: int = spec[2]
+		if total <= 0:
+			continue
+		var direction: int = data.get("%s_direction_advantage" % spec[1], total)
+		var class_bonus: int = data.get("%s_class_advantage" % spec[1], 0)
+		advantage_parts.append("%s 方向%d＋越战%d＝%d" % [
+			_squad_display_name(spec[0]), direction, class_bonus, total
+		])
+	var verdict := "均无优势" if advantage_parts.is_empty() else "；".join(advantage_parts)
 	return "接敌：%s %s%d vs %s %s%d → %s" % [
 		_squad_display_name(first_id),
 		_contact_side_text(first_contact.get("side", &"front")),

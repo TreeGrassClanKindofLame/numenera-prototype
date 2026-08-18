@@ -6,6 +6,10 @@ const CLASS_ARCHER := &"archer"
 const CLASS_ASSASSIN := &"assassin"
 const CLASS_CUSTOM := &"custom"
 
+const RESOURCE_MP := &"mp"
+const RESOURCE_TP := &"tp"
+const RESOURCE_LIMIT := 5
+
 const FRONT_ROW := 0
 const BACK_ROW := 1
 const COLUMN_COUNT := 3
@@ -18,6 +22,7 @@ var health: int
 var max_health: int
 var attack: int
 var speed: int
+var resources: Dictionary
 
 
 func _init(
@@ -27,7 +32,8 @@ func _init(
 	p_health: int = 5,
 	p_max_health: int = 5,
 	p_attack: int = 2,
-	p_speed: int = 2
+	p_speed: int = 2,
+	p_resources: Dictionary = {}
 ) -> void:
 	unit_id = p_unit_id
 	unit_class = p_unit_class
@@ -36,6 +42,11 @@ func _init(
 	max_health = p_max_health
 	attack = p_attack
 	speed = p_speed
+	resources = (
+		initial_resources_for_class(unit_class)
+		if p_resources.is_empty()
+		else p_resources.duplicate(true)
+	)
 
 
 static func create_for_class(
@@ -69,6 +80,19 @@ static func class_stats(p_unit_class: StringName) -> Dictionary:
 			return {"health": 5, "attack": 2, "speed": 2, "preferred_row": FRONT_ROW}
 
 
+static func initial_resources_for_class(p_unit_class: StringName) -> Dictionary:
+	match p_unit_class:
+		CLASS_WARRIOR, CLASS_TANK:
+			return {
+				RESOURCE_TP: {"current": 0, "max": RESOURCE_LIMIT},
+			}
+		CLASS_ARCHER, CLASS_ASSASSIN:
+			return {
+				RESOURCE_MP: {"current": RESOURCE_LIMIT, "max": RESOURCE_LIMIT},
+			}
+	return {}
+
+
 func clone():
 	return get_script().new(
 		unit_id,
@@ -77,8 +101,48 @@ func clone():
 		health,
 		max_health,
 		attack,
-		speed
+		speed,
+		resources
 	)
+
+
+func has_resource(resource_id: StringName) -> bool:
+	return resources.has(resource_id)
+
+
+func resource_value(resource_id: StringName) -> int:
+	if not resources.has(resource_id):
+		return 0
+	return resources[resource_id].get("current", 0)
+
+
+func resource_max(resource_id: StringName) -> int:
+	if not resources.has(resource_id):
+		return 0
+	return resources[resource_id].get("max", 0)
+
+
+func can_spend_resource(resource_id: StringName, amount: int) -> bool:
+	return amount >= 0 and has_resource(resource_id) and resource_value(resource_id) >= amount
+
+
+func spend_resource(resource_id: StringName, amount: int) -> bool:
+	if not can_spend_resource(resource_id, amount):
+		return false
+	var entry: Dictionary = resources[resource_id]
+	entry["current"] = clampi(entry.get("current", 0) - amount, 0, entry.get("max", 0))
+	resources[resource_id] = entry
+	return true
+
+
+func gain_resource(resource_id: StringName, amount: int) -> int:
+	if amount <= 0 or not has_resource(resource_id):
+		return 0
+	var entry: Dictionary = resources[resource_id]
+	var before: int = entry.get("current", 0)
+	entry["current"] = clampi(before + amount, 0, entry.get("max", 0))
+	resources[resource_id] = entry
+	return entry["current"] - before
 
 
 func is_alive() -> bool:
