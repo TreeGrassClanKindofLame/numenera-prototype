@@ -41,6 +41,9 @@ func _run_all() -> void:
 	_test_return_collision_keeps_facing_and_scores_again()
 	_test_round_zero_selection_and_extra_actions()
 	_test_map_move_wait_wall_and_chain()
+	_test_medical_station_rules()
+	_test_electromagnetic_cannon_rules()
+	_test_facility_contest_and_simultaneous_resolution()
 	_test_head_on_squad_battle_returns_survivors()
 	_test_sole_squad_survivor_takes_collision_cell()
 	_test_squad_damage_persists_across_encounters()
@@ -52,6 +55,7 @@ func _run_all() -> void:
 	_test_bandit_vision_and_wall_occlusion()
 	_test_bandit_tentative_detection_and_pursuit()
 	await _test_main_scene_gm_panel_and_combat()
+	await _test_facility_visual_playback()
 	await _test_enemy_scenario_switching_and_debug()
 	await _test_focused_stage_auto_playback()
 	await _test_multi_strike_overlay_visual()
@@ -62,7 +66,7 @@ func _run_all() -> void:
 	await get_tree().create_timer(0.15).timeout
 
 	if _failures == 0:
-		print("PASS: %d checks across 39 squad-combat scenarios." % _checks)
+		print("PASS: %d checks across 41 gameplay scenarios." % _checks)
 		get_tree().quit(0)
 	else:
 		push_error("FAIL: %d of %d checks failed." % [_failures, _checks])
@@ -717,6 +721,146 @@ func _test_map_move_wait_wall_and_chain() -> void:
 	_expect_equal(wall.outcome_for(&"a")["reason"], &"blocked_by_terrain", "terrain still blocks squads")
 
 
+func _test_medical_station_rules() -> void:
+	var warrior = _unit(&"warrior", &"warrior", 0, 0, 5, 1, 1)
+	warrior.health = 1
+	var archer = _unit(&"archer", &"archer", 1, 1, 3, 1, 1)
+	archer.health = 2
+	archer.spend_resource(&"mp", 5)
+	var dead = _unit(&"dead", &"assassin", 2, 1, 3, 1, 1)
+	dead.health = 0
+	var squad = _squad(&"player", &"player", &"player", Vector2i(1, 1), [warrior, archer, dead])
+	var effects := {"traps": [], "facilities": [{
+		"facility_id": &"medical", "type": &"medical_station",
+		"cell": Vector2i(2, 1), "facing": Vector2i.ZERO, "used": false,
+	}]}
+	var result = _resolve(
+		Vector2i(6, 4), [Vector2i(2, 1)], [squad],
+		{&"player": _move(&"player", Vector2i.RIGHT)}, 2001, effects
+	)
+	var healed = result.actor_state_for(&"player")
+	_expect_equal(result.outcome_for(&"player")["reason"], &"activated_facility", "medical station bump activates without movement")
+	_expect_equal(healed.cell, Vector2i(1, 1), "facility remains a blocking cell")
+	_expect_equal(healed.unit_by_id(&"warrior").health, 5, "medical station caps HP at maximum")
+	_expect_equal(healed.unit_by_id(&"archer").resource_value(&"mp"), 5, "medical station refills an existing MP resource")
+	_expect_equal(healed.unit_by_id(&"warrior").resource_value(&"tp"), 0, "medical station never restores TP")
+	_expect_equal(healed.unit_by_id(&"dead").health, 0, "medical station does not revive dead units")
+	_expect_true(result.final_map_effects["facilities"][0]["used"], "medical station is spent immediately")
+	var repeated = _resolve(
+		Vector2i(6, 4), [Vector2i(2, 1)], [healed],
+		{&"player": _move(&"player", Vector2i.RIGHT)}, 2002, result.final_map_effects
+	)
+	_expect_equal(repeated.outcome_for(&"player")["reason"], &"blocked_by_spent_facility", "spent medical station becomes an inert obstacle")
+	_expect_true(repeated.facility_events.is_empty(), "spent facility produces no second event")
+
+
+func _test_electromagnetic_cannon_rules() -> void:
+	var activator = _squad(&"activator", &"shared", &"player", Vector2i(1, 2), [
+		_unit(&"a", &"custom", 1, 0, 8, 0, 1),
+	])
+	var target = _squad(&"target", &"shared", &"npc", Vector2i(4, 2), [
+		_unit(&"t1", &"custom", 0, 0, 8, 0, 1),
+		_unit(&"t2", &"custom", 2, 1, 5, 0, 1),
+	])
+	var effects := {"traps": [], "facilities": [{
+		"facility_id": &"cannon", "type": &"electromagnetic_cannon",
+		"cell": Vector2i(2, 2), "facing": Vector2i.RIGHT, "used": false,
+	}]}
+	var fired = _resolve(
+		Vector2i(7, 5), [Vector2i(2, 2)], [activator, target],
+		{&"activator": _move(&"activator", Vector2i.RIGHT), &"target": _wait(&"target")},
+		2101, effects
+	)
+	_expect_equal(fired.facility_events[0]["target_actor_id"], &"target", "cannon targets the first squad regardless of faction")
+	_expect_equal(fired.actor_state_for(&"target").unit_by_id(&"t1").health, 5, "cannon damages every living unit by three")
+	_expect_equal(fired.actor_state_for(&"target").unit_by_id(&"t2").health, 2, "cannon applies equal squad-wide damage")
+	var blocked_effects := effects.duplicate(true)
+	var occluded = _resolve(
+		Vector2i(7, 5), [Vector2i(2, 2), Vector2i(3, 2)], [activator, target],
+		{&"activator": _move(&"activator", Vector2i.RIGHT), &"target": _wait(&"target")},
+		2102, blocked_effects
+	)
+	_expect_equal(occluded.facility_events[0]["status"], &"no_target", "wall stops cannon before squads behind it")
+	_expect_equal(occluded.actor_state_for(&"target").unit_by_id(&"t1").health, 8, "occluded squad takes no cannon damage")
+	_expect_true(occluded.final_map_effects["facilities"][0]["used"], "cannon is consumed even when it has no target")
+	var fragile = _squad(&"fragile", &"fragile", &"npc", Vector2i(1, 1), [
+		_unit(&"fragile_u", &"custom", 1, 0, 1, 0, 1),
+	])
+	var killer = _squad(&"killer", &"killer", &"npc", Vector2i(1, 2), [
+		_unit(&"killer_u", &"custom", 1, 0, 8, 5, 3),
+	], Vector2i.UP)
+	var distant = _squad(&"distant", &"distant", &"npc", Vector2i(4, 1), [
+		_unit(&"distant_u", &"custom", 1, 0, 8, 0, 1),
+	])
+	var latched = _resolve(
+		Vector2i(7, 5), [Vector2i(2, 1)], [fragile, killer, distant], {
+			&"fragile": _move(&"fragile", Vector2i.RIGHT),
+			&"killer": _move(&"killer", Vector2i.UP),
+			&"distant": _wait(&"distant"),
+		}, 2103, {"traps": [], "facilities": [{
+			"facility_id": &"latched_cannon", "type": &"electromagnetic_cannon",
+			"cell": Vector2i(2, 1), "facing": Vector2i.RIGHT, "used": false,
+		}]}
+	)
+	_expect_true(latched.is_dead(&"fragile"), "facility activator can die in collision combat")
+	_expect_equal(latched.actor_state_for(&"distant").unit_by_id(&"distant_u").health, 5, "latched cannon still fires after its activator dies")
+
+
+func _test_facility_contest_and_simultaneous_resolution() -> void:
+	var player_unit = _unit(&"p", &"warrior", 1, 0, 5, 0, 1)
+	player_unit.health = 1
+	var player = _squad(&"player", &"player", &"player", Vector2i(1, 2), [player_unit])
+	var rival = _squad(&"rival", &"rival", &"npc", Vector2i(2, 1), [
+		_unit(&"r", &"custom", 1, 0, 8, 0, 1),
+	])
+	var cannon_user = _squad(&"cannon_user", &"neutral", &"npc", Vector2i(0, 4), [
+		_unit(&"c", &"custom", 1, 0, 8, 0, 1),
+	])
+	var effects := {"traps": [], "facilities": [
+		{"facility_id": &"medical", "type": &"medical_station", "cell": Vector2i(2, 2), "facing": Vector2i.ZERO, "used": false},
+		{"facility_id": &"cannon", "type": &"electromagnetic_cannon", "cell": Vector2i(1, 4), "facing": Vector2i.UP, "used": false},
+	]}
+	var result = _resolve(
+		Vector2i(6, 6), [Vector2i(2, 2), Vector2i(1, 4)],
+		[player, rival, cannon_user], {
+			&"player": _move(&"player", Vector2i.RIGHT),
+			&"rival": _move(&"rival", Vector2i.DOWN),
+			&"cannon_user": _move(&"cannon_user", Vector2i.RIGHT),
+		}, 2201, effects
+	)
+	_expect_equal(result.facility_events[1]["activator_actor_id"], &"player", "player-controlled squad wins a contested facility")
+	_expect_equal(result.outcome_for(&"rival")["reason"], &"facility_contested", "losing contender consumes its turn without activation")
+	_expect_equal(result.actor_state_for(&"player").unit_by_id(&"p").health, 2, "medical heal and cannon damage use one post-combat snapshot")
+	_expect_true(result.final_map_effects["facilities"][0]["used"], "contested medical station is consumed once")
+	_expect_true(result.final_map_effects["facilities"][1]["used"], "simultaneously activated cannon is consumed once")
+	var npc_a = _squad(&"npc_a", &"a", &"npc", Vector2i(1, 2), [
+		_unit(&"na", &"custom", 1, 0, 5, 0, 1),
+	])
+	var npc_b = _squad(&"npc_b", &"b", &"npc", Vector2i(2, 1), [
+		_unit(&"nb", &"custom", 1, 0, 5, 0, 1),
+	])
+	var npc_effects := {"traps": [], "facilities": [{
+		"facility_id": &"npc_medical", "type": &"medical_station",
+		"cell": Vector2i(2, 2), "facing": Vector2i.ZERO, "used": false,
+	}]}
+	var npc_intents := {
+		&"npc_a": _move(&"npc_a", Vector2i.RIGHT),
+		&"npc_b": _move(&"npc_b", Vector2i.DOWN),
+	}
+	var npc_first = _resolve(
+		Vector2i(5, 5), [Vector2i(2, 2)], [npc_a, npc_b], npc_intents, 2202, npc_effects
+	)
+	var npc_second = _resolve(
+		Vector2i(5, 5), [Vector2i(2, 2)], [npc_a, npc_b], npc_intents, 2202,
+		npc_effects.duplicate(true)
+	)
+	_expect_equal(
+		npc_first.facility_events[0]["activator_actor_id"],
+		npc_second.facility_events[0]["activator_actor_id"],
+		"NPC-only facility contest is reproducible from the turn seed"
+	)
+
+
 func _test_head_on_squad_battle_returns_survivors() -> void:
 	var player = _squad(&"player", &"player", &"player", Vector2i(1, 1), [_unit(&"p", &"custom", 1, 0, 10, 1, 2)])
 	var enemy = _squad(&"enemy", &"enemy", &"npc", Vector2i(2, 1), [_unit(&"e", &"custom", 1, 0, 10, 1, 2)])
@@ -995,6 +1139,37 @@ func _test_main_scene_gm_panel_and_combat() -> void:
 	_expect_true(not main._battle_overlay.visible, "battle overlay closes after complete presentation")
 	_expect_true(not main._busy, "input unlocks after squad battle animation")
 	_capture_viewport("res://.godot/test_preview.png", "squad preview can be captured")
+	main.queue_free()
+	await get_tree().process_frame
+
+
+func _test_facility_visual_playback() -> void:
+	var main = MainScene.instantiate()
+	add_child(main)
+	await get_tree().process_frame
+	_expect_equal(main._map_effects["facilities"].size(), 2, "each validation map loads both facility types")
+	_expect_true(main._blocked.has(Vector2i(1, 5)), "medical station is included in map blocking")
+	_expect_true(main._blocked.has(Vector2i(3, 4)), "electromagnetic cannon is included in map blocking")
+	var player = main._actors[&"player"]
+	player.cell = Vector2i(1, 4)
+	player.unit_by_id(&"player_0").health = 2
+	player.unit_by_id(&"player_2").spend_resource(&"mp", 5)
+	player.sync_summary_stats()
+	main._actor_views[&"player"].position = main._cell_to_world(player.cell)
+	await main._play_turn(_move(&"player", Vector2i.DOWN))
+	_expect_true(main._map_effects["facilities"][0]["used"], "integrated medical playback leaves the facility spent")
+	_expect_true(main._log_label.text.contains("医疗站"), "facility playback writes a readable turn log")
+	_capture_viewport("res://.godot/facility_used_preview.png", "spent facility state can be captured")
+	main._facility_animation_event = {
+		"facility_type": &"electromagnetic_cannon",
+		"cell": Vector2i(3, 4),
+		"facing": Vector2i.UP,
+		"ray_cells": [Vector2i(3, 3), Vector2i(3, 2)],
+	}
+	main.queue_redraw()
+	await get_tree().process_frame
+	_capture_viewport("res://.godot/facility_cannon_preview.png", "cannon beam feedback can be captured")
+	main._facility_animation_event = {}
 	main.queue_free()
 	await get_tree().process_frame
 

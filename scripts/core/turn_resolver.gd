@@ -12,6 +12,11 @@ const SKILL_GUARD := &"guard"
 const BANDAGE_HEAL := 2
 const FIRST_STRIKE_DAMAGE := 1
 const TRAP_DAMAGE := 2
+const FACILITY_MEDICAL := &"medical_station"
+const FACILITY_CANNON := &"electromagnetic_cannon"
+const MEDICAL_HEAL := 10
+const MEDICAL_MP_GAIN := 10
+const CANNON_DAMAGE := 3
 const PASSIVE_BATTLE_HARDENED_COUNT := &"battle_hardened_count"
 const PASSIVE_BATTLE_HARDENED_USED := &"battle_hardened_used"
 
@@ -41,9 +46,15 @@ static func resolve(
 	var valid_movers: Dictionary = {}
 	var actor_reasons: Dictionary = {}
 	var pending_grid_skills: Array = []
+	var facility_bumps: Dictionary = {}
 	var effects: Dictionary = map_effects.duplicate(true)
 	if not effects.has("traps"):
 		effects["traps"] = []
+	if not effects.has("facilities"):
+		effects["facilities"] = []
+	var effective_blocked := blocked.duplicate()
+	for facility: Dictionary in effects["facilities"]:
+		effective_blocked[facility.get("cell", Vector2i(-1, -1))] = true
 
 	for source_actor in actor_states:
 		var actor = source_actor.clone()
@@ -97,7 +108,21 @@ static func resolve(
 				movement_result["valid"] = false
 				movement_result["reason"] = &"out_of_bounds"
 				actor_reasons[actor_id] = &"out_of_bounds"
-			elif blocked.has(target):
+			elif _facility_index_at(effects, target) >= 0:
+				movement_result["valid"] = false
+				var facility_index := _facility_index_at(effects, target)
+				var facility: Dictionary = effects["facilities"][facility_index]
+				if facility.get("used", false):
+					movement_result["reason"] = &"blocked_by_spent_facility"
+					actor_reasons[actor_id] = &"blocked_by_spent_facility"
+				else:
+					movement_result["reason"] = &"facility_candidate"
+					actor_reasons[actor_id] = &"facility_candidate"
+					var facility_id: StringName = facility["facility_id"]
+					var candidates: Array = facility_bumps.get(facility_id, [])
+					candidates.append(actor_id)
+					facility_bumps[facility_id] = candidates
+			elif effective_blocked.has(target):
 				movement_result["valid"] = false
 				movement_result["reason"] = &"blocked_by_terrain"
 				actor_reasons[actor_id] = &"blocked_by_terrain"
@@ -113,6 +138,10 @@ static func resolve(
 		result.movement_results[actor_id] = movement_result
 		result.movement_positions[actor_id] = current_positions[actor_id]
 		result.tentative_positions[actor_id] = current_positions[actor_id]
+
+	var pending_facilities := _prepare_facility_activations(
+		facility_bumps, states, effects, result, actor_reasons, battle_seed
+	)
 
 	var next_wave_index := 0
 	var dead_actor_ids: Array = []
@@ -186,9 +215,10 @@ static func resolve(
 		next_wave_index += 1
 		grid_wave_count += 1
 
-	_resolve_grid_skills(
-		pending_grid_skills, states, current_positions, dead_actor_ids, actor_reasons, result,
-		blocked, board_size, effects, battle_rng
+	_resolve_post_combat_effects(
+		pending_grid_skills, pending_facilities, states, current_positions,
+		dead_actor_ids, actor_reasons, result,
+		effective_blocked, board_size, effects, battle_rng
 	)
 	result.final_map_effects = effects.duplicate(true)
 
@@ -211,7 +241,7 @@ static func resolve(
 		var reason: StringName = actor_reasons.get(actor_id, &"waited")
 		var moved: bool = actor.cell != initial_positions[actor_id]
 		var success: bool = reason in [
-			&"moved", &"waited", &"used_grid_skill",
+			&"moved", &"waited", &"used_grid_skill", &"activated_facility",
 			&"combat_winner_moved", &"combat_winner_held"
 		]
 		result.set_outcome(actor_id, success, moved, reason, actor.cell)
@@ -685,8 +715,63 @@ static func _prepare_grid_skill(actor, intent, map_effects: Dictionary) -> Dicti
 	return event
 
 
-static func _resolve_grid_skills(
+static func _prepare_facility_activations(
+	facility_bumps: Dictionary,
+	states: Dictionary,
+	map_effects: Dictionary,
+	result,
+	actor_reasons: Dictionary,
+	battle_seed: int
+) -> Array:
+	var pending: Array = []
+	var facility_ids := facility_bumps.keys()
+	facility_ids.sort()
+	for facility_id: StringName in facility_ids:
+		var index := _facility_index_by_id(map_effects, facility_id)
+		if index < 0:
+			continue
+		var facility: Dictionary = map_effects["facilities"][index].duplicate(true)
+		if facility.get("used", false):
+			continue
+		var candidates: Array = facility_bumps[facility_id].duplicate()
+		candidates.sort()
+		var player_candidates: Array = []
+		for actor_id: StringName in candidates:
+			if states[actor_id].controller == &"player":
+				player_candidates.append(actor_id)
+		var winner: StringName
+		if not player_candidates.is_empty():
+			winner = player_candidates[0]
+		else:
+			var facility_rng := RandomNumberGenerator.new()
+			facility_rng.seed = hash("%d:%s" % [battle_seed, String(facility_id)])
+			winner = candidates[facility_rng.randi_range(0, candidates.size() - 1)]
+		facility["used"] = true
+		map_effects["facilities"][index] = facility
+		for actor_id: StringName in candidates:
+			var won := actor_id == winner
+			actor_reasons[actor_id] = &"activated_facility" if won else &"facility_contested"
+			result.movement_results[actor_id]["valid"] = won
+			result.movement_results[actor_id]["reason"] = actor_reasons[actor_id]
+		pending.append({
+			"facility_id": facility_id,
+			"facility_type": facility["type"],
+			"cell": facility["cell"],
+			"facing": facility.get("facing", Vector2i.ZERO),
+			"candidate_actor_ids": candidates,
+			"activator_actor_id": winner,
+			"status": &"pending",
+			"heals": [],
+			"resource_gains": [],
+			"damages": [],
+			"ray_cells": [],
+		})
+	return pending
+
+
+static func _resolve_post_combat_effects(
 	pending_grid_skills: Array,
+	pending_facilities: Array,
 	states: Dictionary,
 	current_positions: Dictionary,
 	dead_actor_ids: Array,
@@ -698,7 +783,10 @@ static func _resolve_grid_skills(
 	battle_rng: RandomNumberGenerator
 ) -> void:
 	var health_deltas: Dictionary = {}
+	var resource_deltas: Dictionary = {}
 	var resolved_events: Array = []
+	var resolved_facilities: Array = []
+	var facility_damage_targets: Dictionary = {}
 	var next_guard_order := _next_guard_order(states)
 	for pending: Dictionary in pending_grid_skills:
 		var event := pending.duplicate(true)
@@ -753,6 +841,69 @@ static func _resolve_grid_skills(
 				next_guard_order += 1
 		resolved_events.append(event)
 
+	for pending: Dictionary in pending_facilities:
+		var event := pending.duplicate(true)
+		var activator_id: StringName = event["activator_actor_id"]
+		match event["facility_type"]:
+			FACILITY_MEDICAL:
+				var actor = states.get(activator_id)
+				if actor == null or activator_id in dead_actor_ids or not actor.is_alive():
+					event["status"] = &"activator_dead"
+				else:
+					event["status"] = &"resolved"
+					for unit in actor.units:
+						if not unit.is_alive():
+							continue
+						var heal_amount := mini(MEDICAL_HEAL, unit.max_health - unit.health)
+						_add_health_delta(health_deltas, activator_id, unit.unit_id, heal_amount)
+						event["heals"].append({
+							"unit_id": unit.unit_id,
+							"health_before": unit.health,
+							"amount": heal_amount,
+						})
+						if unit.has_resource(SquadUnitStateType.RESOURCE_MP):
+							var gain := mini(
+								MEDICAL_MP_GAIN,
+								unit.resource_max(SquadUnitStateType.RESOURCE_MP)
+									- unit.resource_value(SquadUnitStateType.RESOURCE_MP)
+							)
+							_add_resource_delta(
+								resource_deltas, activator_id, unit.unit_id,
+								SquadUnitStateType.RESOURCE_MP, gain
+							)
+							event["resource_gains"].append({
+								"unit_id": unit.unit_id,
+								"resource_id": SquadUnitStateType.RESOURCE_MP,
+								"resource_before": unit.resource_value(SquadUnitStateType.RESOURCE_MP),
+								"amount": gain,
+							})
+			FACILITY_CANNON:
+				event["status"] = &"resolved"
+				var ray := _first_squad_in_facility_ray(
+					event["cell"], event["facing"], current_positions,
+					states, blocked, board_size
+				)
+				event["ray_cells"] = ray["ray_cells"]
+				var target_id: StringName = ray["target_actor_id"]
+				event["target_actor_id"] = target_id
+				if target_id == &"":
+					event["status"] = &"no_target"
+				else:
+					facility_damage_targets[target_id] = true
+					for unit in states[target_id].units:
+						if unit.is_alive():
+							_add_health_delta(
+								health_deltas, target_id, unit.unit_id, -CANNON_DAMAGE
+							)
+							event["damages"].append({
+								"unit_id": unit.unit_id,
+								"health_before": unit.health,
+								"amount": CANNON_DAMAGE,
+							})
+			_:
+				event["status"] = &"unknown_facility"
+		resolved_facilities.append(event)
+
 	# All post-combat skills selected their targets from the same snapshot. Apply
 	# their combined health changes only after every live source has resolved.
 	for actor_id: StringName in health_deltas:
@@ -768,8 +919,22 @@ static func _resolve_grid_skills(
 		actor.sync_summary_stats()
 		if not actor.is_alive() and not actor_id in dead_actor_ids:
 			dead_actor_ids.append(actor_id)
-			actor_reasons[actor_id] = &"died_to_grid_skill"
+			actor_reasons[actor_id] = (
+				&"died_to_facility" if facility_damage_targets.has(actor_id)
+				else &"died_to_grid_skill"
+			)
 			current_positions.erase(actor_id)
+
+	for actor_id: StringName in resource_deltas:
+		var actor = states.get(actor_id)
+		if actor == null:
+			continue
+		for unit_id: StringName in resource_deltas[actor_id]:
+			var unit = actor.unit_by_id(unit_id)
+			if unit == null:
+				continue
+			for resource_id: StringName in resource_deltas[actor_id][unit_id]:
+				unit.gain_resource(resource_id, resource_deltas[actor_id][unit_id][resource_id])
 
 	for event: Dictionary in resolved_events:
 		var event_actor = states.get(event["actor_id"])
@@ -783,6 +948,21 @@ static func _resolve_grid_skills(
 				damage["health_after"] = unit.health
 		result.grid_skill_events.append(event)
 
+	for event: Dictionary in resolved_facilities:
+		var activator = states.get(event["activator_actor_id"])
+		for heal: Dictionary in event["heals"]:
+			heal["health_after"] = activator.unit_by_id(heal["unit_id"]).health
+		for gain: Dictionary in event["resource_gains"]:
+			gain["resource_after"] = activator.unit_by_id(gain["unit_id"]).resource_value(
+				gain["resource_id"]
+			)
+		var target_id: StringName = event.get("target_actor_id", &"")
+		if target_id != &"":
+			var target_actor = states.get(target_id)
+			for damage: Dictionary in event["damages"]:
+				damage["health_after"] = target_actor.unit_by_id(damage["unit_id"]).health
+		result.facility_events.append(event)
+
 
 static func _add_health_delta(
 	deltas: Dictionary, actor_id: StringName, unit_id: StringName, amount: int
@@ -790,6 +970,22 @@ static func _add_health_delta(
 	if not deltas.has(actor_id):
 		deltas[actor_id] = {}
 	deltas[actor_id][unit_id] = deltas[actor_id].get(unit_id, 0) + amount
+
+
+static func _add_resource_delta(
+	deltas: Dictionary,
+	actor_id: StringName,
+	unit_id: StringName,
+	resource_id: StringName,
+	amount: int
+) -> void:
+	if not deltas.has(actor_id):
+		deltas[actor_id] = {}
+	if not deltas[actor_id].has(unit_id):
+		deltas[actor_id][unit_id] = {}
+	deltas[actor_id][unit_id][resource_id] = (
+		deltas[actor_id][unit_id].get(resource_id, 0) + amount
+	)
 
 
 static func _first_hostile_in_ray(
@@ -808,6 +1004,47 @@ static func _first_hostile_in_ray(
 		if not candidates.is_empty():
 			return candidates[0]
 	return &""
+
+
+static func _first_squad_in_facility_ray(
+	origin: Vector2i,
+	facing: Vector2i,
+	current_positions: Dictionary,
+	states: Dictionary,
+	blocked: Dictionary,
+	board_size: Vector2i
+) -> Dictionary:
+	var ray_cells: Array = []
+	var cell := origin + facing
+	while _is_inside(cell, board_size):
+		if blocked.has(cell):
+			break
+		ray_cells.append(cell)
+		var candidates: Array = []
+		for actor_id: StringName in current_positions:
+			if current_positions[actor_id] == cell and states[actor_id].is_alive():
+				candidates.append(actor_id)
+		candidates.sort()
+		if not candidates.is_empty():
+			return {"target_actor_id": candidates[0], "ray_cells": ray_cells}
+		cell += facing
+	return {"target_actor_id": &"", "ray_cells": ray_cells}
+
+
+static func _facility_index_at(map_effects: Dictionary, cell: Vector2i) -> int:
+	var facilities: Array = map_effects.get("facilities", [])
+	for index in facilities.size():
+		if facilities[index].get("cell", Vector2i(-1, -1)) == cell:
+			return index
+	return -1
+
+
+static func _facility_index_by_id(map_effects: Dictionary, facility_id: StringName) -> int:
+	var facilities: Array = map_effects.get("facilities", [])
+	for index in facilities.size():
+		if facilities[index].get("facility_id", &"") == facility_id:
+			return index
+	return -1
 
 
 static func _next_guard_order(states: Dictionary) -> int:

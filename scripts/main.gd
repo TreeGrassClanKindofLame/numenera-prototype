@@ -32,6 +32,8 @@ const SKILL_BANDAGE := &"bandage"
 const SKILL_FIRST_STRIKE := &"first_strike"
 const SKILL_TRAP := &"trap"
 const SKILL_GUARD := &"guard"
+const FACILITY_MEDICAL := &"medical_station"
+const FACILITY_CANNON := &"electromagnetic_cannon"
 
 const COLOR_BACKGROUND := Color("111722")
 const COLOR_FLOOR_A := Color("202b3a")
@@ -48,6 +50,10 @@ const COLOR_BANDIT := Color("e16f5b")
 const COLOR_VISION := Color(0.95, 0.72, 0.22, 0.20)
 const COLOR_ALERT_VISION := Color(0.95, 0.25, 0.20, 0.24)
 const COLOR_PATROL := Color(0.48, 0.58, 0.96, 0.24)
+const COLOR_MEDICAL := Color("67e8d1")
+const COLOR_CANNON := Color("72b7ff")
+const COLOR_FACILITY_BASE := Color("334155")
+const COLOR_FACILITY_SPENT := Color("596273")
 
 var _blocked: Dictionary = {}
 var _actors: Dictionary = {}
@@ -56,7 +62,7 @@ var _enemy_brains: Dictionary = {}
 var _enemy_ai = EnemyAIControllerType.new()
 var _scenario_id: StringName = ScenarioCatalogType.SCENARIO_DUMMY
 var _scenario: Dictionary = {}
-var _map_effects: Dictionary = {"traps": []}
+var _map_effects: Dictionary = {"traps": [], "facilities": []}
 var _turn_number := 1
 var _busy := false
 
@@ -79,6 +85,7 @@ var _bandage_button: Button
 var _bandage_targeting := false
 var _grid_skill_buttons: Dictionary = {}
 var _selected_grid_skill: StringName = &""
+var _facility_animation_event: Dictionary = {}
 
 
 func _ready() -> void:
@@ -232,6 +239,8 @@ func _play_resolution_animation(
 			next_wave = resolution.collision_waves[wave_index + 1]
 		await _play_wave_settle(wave, next_wave)
 	await _play_grid_skill_events(resolution.grid_skill_events)
+	await _play_facility_events(resolution.facility_events)
+	_remove_post_combat_dead_views(resolution.dead_actor_ids)
 
 
 func _play_trap_events(events: Array) -> void:
@@ -278,6 +287,51 @@ func _play_grid_skill_events(events: Array) -> void:
 		pulse.tween_property(view, "modulate", Color.WHITE, SETTLE_DURATION * 0.5)
 		pulse.parallel().tween_property(view, "scale", Vector2.ONE, SETTLE_DURATION * 0.5)
 		await pulse.finished
+
+
+func _play_facility_events(events: Array) -> void:
+	for event: Dictionary in events:
+		_facility_animation_event = event
+		queue_redraw()
+		var facility_type: StringName = event.get("facility_type", &"")
+		var view = null
+		var pulse_color := COLOR_MEDICAL
+		if facility_type == FACILITY_MEDICAL:
+			var activator_id: StringName = event.get("activator_actor_id", &"")
+			if _actor_views.has(activator_id):
+				view = _actor_views[activator_id]
+				var total_heal := 0
+				for heal: Dictionary in event.get("heals", []):
+					total_heal += heal.get("amount", 0)
+				view.set_health(view.health + total_heal)
+		elif facility_type == FACILITY_CANNON:
+			pulse_color = Color("ff725f")
+			var target_id: StringName = event.get("target_actor_id", &"")
+			if _actor_views.has(target_id):
+				view = _actor_views[target_id]
+				var total_damage := 0
+				for damage: Dictionary in event.get("damages", []):
+					total_damage += damage.get("amount", 0)
+				view.set_health(view.health - total_damage)
+		if view != null:
+			var pulse := create_tween()
+			pulse.tween_property(view, "modulate", pulse_color, SETTLE_DURATION * 0.5)
+			pulse.parallel().tween_property(view, "scale", Vector2.ONE * 1.12, SETTLE_DURATION * 0.5)
+			pulse.tween_property(view, "modulate", Color.WHITE, SETTLE_DURATION * 0.5)
+			pulse.parallel().tween_property(view, "scale", Vector2.ONE, SETTLE_DURATION * 0.5)
+			await pulse.finished
+		else:
+			await get_tree().create_timer(SETTLE_DURATION).timeout
+		_facility_animation_event = {}
+		queue_redraw()
+
+
+func _remove_post_combat_dead_views(dead_actor_ids: Array) -> void:
+	for actor_id: StringName in dead_actor_ids:
+		if not _actor_views.has(actor_id):
+			continue
+		_actor_views[actor_id].queue_free()
+		_actor_views.erase(actor_id)
 
 
 func _build_collision_stages(resolution) -> Dictionary:
@@ -529,7 +583,7 @@ func _parse_map() -> void:
 	_blocked.clear()
 	_actors.clear()
 	_enemy_brains.clear()
-	_map_effects = {"traps": []}
+	_map_effects = {"traps": [], "facilities": []}
 	var map_rows: Array = _scenario.get("map_rows", [])
 	for y in BOARD_SIZE.y:
 		var row: String = map_rows[y]
@@ -573,6 +627,11 @@ func _parse_map() -> void:
 		_actors[&"player"] = _make_default_squad(
 			&"player", player_cell, &"player", &"player", Vector2i.DOWN
 		)
+	for source: Dictionary in _scenario.get("facilities", []):
+		var facility := source.duplicate(true)
+		facility["used"] = false
+		_map_effects["facilities"].append(facility)
+		_blocked[facility["cell"]] = true
 
 
 func _make_default_squad(
@@ -695,7 +754,7 @@ func _build_interface() -> void:
 	_build_scenario_controls()
 
 	add_child(_make_label(
-		"操作\nW / A / S / D　移动一格\nR　　　　　　 等待",
+		"操作\nW / A / S / D 移动｜R 等待\n撞击设施：战后触发，每座一次",
 		Vector2(644.0, 151.0), Vector2(268.0, 78.0), 15, COLOR_TEXT
 	))
 	add_child(_make_label(
@@ -1217,6 +1276,29 @@ func _format_turn_log(turn_index: int, intents: Dictionary, resolution) -> Strin
 			lines.append("陷阱：已在当前格放置")
 		elif event.get("skill_id", &"") == SKILL_GUARD:
 			lines.append("戒备：已生效，将保留至一次劣势接敌")
+	for event: Dictionary in resolution.facility_events:
+		var facility_name := _facility_name(event.get("facility_type", &""))
+		var activator_name := _actor_name(event.get("activator_actor_id", &""))
+		if event.get("facility_type", &"") == FACILITY_MEDICAL:
+			if event.get("status", &"") == &"activator_dead":
+				lines.append("%s：%s触发后全灭，设施已消耗" % [facility_name, activator_name])
+			else:
+				var total_heal := 0
+				var total_mp := 0
+				for heal: Dictionary in event.get("heals", []):
+					total_heal += heal.get("amount", 0)
+				for gain: Dictionary in event.get("resource_gains", []):
+					total_mp += gain.get("amount", 0)
+				lines.append("%s：%s全队恢复 %d HP、%d MP" % [
+					facility_name, activator_name, total_heal, total_mp
+				])
+		elif event.get("status", &"") == &"no_target":
+			lines.append("%s：%s触发，射线内没有目标" % [facility_name, activator_name])
+		else:
+			lines.append("%s：%s触发，命中%s全队" % [
+				facility_name, activator_name,
+				_actor_name(event.get("target_actor_id", &""))
+			])
 	for actor_id: StringName in intents:
 		var intent = intents[actor_id]
 		var outcome: Dictionary = resolution.outcome_for(actor_id)
@@ -1284,6 +1366,12 @@ func _reason_text(reason: StringName) -> String:
 			return "技能使用失败"
 		&"blocked_by_terrain":
 			return "地形阻挡"
+		&"blocked_by_spent_facility":
+			return "设施已失效，仍然阻挡"
+		&"activated_facility":
+			return "设施已触发"
+		&"facility_contested":
+			return "设施争夺失败"
 		&"out_of_bounds":
 			return "超出地图"
 		&"friendly_collision":
@@ -1298,6 +1386,8 @@ func _reason_text(reason: StringName) -> String:
 			return "碰撞状态异常，安全复位"
 		&"died_in_combat":
 			return "战斗死亡"
+		&"died_to_facility":
+			return "被设施击毁"
 		&"occupied_actor_not_leaving":
 			return "占用者未离开"
 		&"invalid_direction":
@@ -1335,6 +1425,8 @@ func _draw() -> void:
 			var floor_color := COLOR_FLOOR_A if (x + y) % 2 == 0 else COLOR_FLOOR_B
 			draw_rect(cell_rect, COLOR_WALL if _blocked.has(cell) else floor_color)
 			draw_rect(cell_rect, COLOR_GRID, false, 1.0)
+	for facility: Dictionary in _map_effects.get("facilities", []):
+		_draw_facility(facility)
 	var debug_enabled := _ai_debug_toggle != null and _ai_debug_toggle.button_pressed
 	for trap: Dictionary in _map_effects.get("traps", []):
 		if trap.get("faction", &"") != &"player" and not debug_enabled:
@@ -1343,6 +1435,7 @@ func _draw() -> void:
 		draw_circle(center, 9.0, Color("a76be8"))
 		draw_line(center + Vector2(-7, -7), center + Vector2(7, 7), Color.WHITE, 2.0)
 		draw_line(center + Vector2(7, -7), center + Vector2(-7, 7), Color.WHITE, 2.0)
+	_draw_facility_animation()
 	if _ai_debug_toggle == null or not _ai_debug_toggle.button_pressed:
 		return
 	match _scenario_id:
@@ -1350,6 +1443,57 @@ func _draw() -> void:
 			_draw_robot_debug()
 		ScenarioCatalogType.SCENARIO_BANDIT:
 			_draw_bandit_debug()
+
+
+func _draw_facility(facility: Dictionary) -> void:
+	var center := _cell_to_world(facility.get("cell", Vector2i.ZERO))
+	var spent: bool = facility.get("used", false)
+	var accent := COLOR_FACILITY_SPENT
+	if not spent:
+		accent = (
+			COLOR_MEDICAL
+			if facility.get("type", &"") == FACILITY_MEDICAL
+			else COLOR_CANNON
+		)
+	draw_rect(Rect2(center - Vector2(16, 16), Vector2(32, 32)), COLOR_FACILITY_BASE, true)
+	draw_rect(Rect2(center - Vector2(16, 16), Vector2(32, 32)), accent, false, 2.5)
+	if facility.get("type", &"") == FACILITY_MEDICAL:
+		draw_rect(Rect2(center + Vector2(-3, -11), Vector2(6, 22)), accent, true)
+		draw_rect(Rect2(center + Vector2(-11, -3), Vector2(22, 6)), accent, true)
+	else:
+		var direction := Vector2(facility.get("facing", Vector2i.UP)).normalized()
+		draw_circle(center - direction * 4.0, 8.0, accent)
+		draw_line(center - direction * 2.0, center + direction * 15.0, accent, 7.0)
+		draw_line(
+			center + direction * 15.0,
+			center + direction * 10.0 + direction.rotated(PI * 0.5) * 5.0,
+			accent,
+			3.0
+		)
+	if spent:
+		draw_line(center + Vector2(-13, 13), center + Vector2(13, -13), COLOR_MUTED, 2.5)
+
+
+func _draw_facility_animation() -> void:
+	if _facility_animation_event.is_empty():
+		return
+	var center := _cell_to_world(_facility_animation_event.get("cell", Vector2i.ZERO))
+	var type: StringName = _facility_animation_event.get("facility_type", &"")
+	var color := COLOR_MEDICAL if type == FACILITY_MEDICAL else COLOR_CANNON
+	draw_arc(center, 22.0, 0.0, TAU, 32, color, 4.0)
+	if type != FACILITY_CANNON:
+		return
+	var ray_cells: Array = _facility_animation_event.get("ray_cells", [])
+	var direction := Vector2(_facility_animation_event.get("facing", Vector2i.UP))
+	var end := center + direction * 18.0
+	if not ray_cells.is_empty():
+		end = _cell_to_world(ray_cells.back())
+	draw_line(center, end, Color("bde7ff"), 7.0)
+	draw_line(center, end, Color.WHITE, 2.0)
+
+
+func _facility_name(type: StringName) -> String:
+	return "医疗站" if type == FACILITY_MEDICAL else "电磁炮"
 
 
 func _draw_robot_debug() -> void:
