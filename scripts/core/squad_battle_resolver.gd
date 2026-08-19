@@ -86,16 +86,25 @@ static func _resolve_turns(
 	var event_start: int = result["events"].size()
 	for phase_index in turns.size():
 		var turn: Dictionary = turns[phase_index]
+		var schedule_index: int = result["turn_schedule"].size()
+		var schedule_entry := _schedule_entry(
+			turn, phase, phase_index, &"normal_action", &""
+		)
+		schedule_entry["schedule_index"] = schedule_index
+		result["turn_schedule"].append(schedule_entry)
 		var acting_squad = first_squad if turn["squad_id"] == first_squad.actor_id else second_squad
 		var defending_squad = second_squad if acting_squad == first_squad else first_squad
 		var attacker = acting_squad.unit_by_id(turn["unit_id"])
 		if attacker == null or not attacker.is_alive():
-			_append_skipped_action(result, turn, phase, phase_index, &"normal_attack", &"", &"actor_dead")
+			_mark_schedule_skipped(result, schedule_index, &"actor_dead")
 			continue
 		if not defending_squad.is_alive():
-			_append_skipped_action(result, turn, phase, phase_index, &"normal_attack", &"", &"no_living_enemy")
+			_mark_schedule_skipped(result, schedule_index, &"no_living_enemy")
 			continue
 
+		var turn_event_start: int = result["events"].size()
+		var summary_action_kind := &"normal_action"
+		var summary_skill_id: StringName = &""
 		var activation: Dictionary = {}
 		if (
 			attacker.unit_class == SquadUnitStateType.CLASS_TANK
@@ -112,6 +121,8 @@ static func _resolve_turns(
 				"resource_before": protect_tp_before,
 				"resource_spent": PROTECT_TP_COST,
 			}
+			summary_action_kind = &"protect_action"
+			summary_skill_id = SKILL_PROTECT
 
 		if (
 			attacker.unit_class == SquadUnitStateType.CLASS_ASSASSIN
@@ -125,12 +136,19 @@ static func _resolve_turns(
 				result, turn, phase, phase_index, &"bullying_attack", SKILL_BULLY,
 				acting_squad, defending_squad, attacker, first_squad, second_squad, rng,
 				{}, -1, 0, {
+					"schedule_index": schedule_index,
 					"target_info": bully_target_info,
 					"resource_id": SquadUnitStateType.RESOURCE_MP,
 					"resource_before": bully_mp_before,
 					"resource_spent": BULLY_MP_COST,
 					"protection_queues": protection_queues,
 				}
+			)
+			summary_action_kind = &"bullying_action"
+			summary_skill_id = SKILL_BULLY
+			_finalize_schedule(
+				result, schedule_index, turn_event_start,
+				summary_action_kind, summary_skill_id
 			)
 			continue
 
@@ -154,6 +172,7 @@ static func _resolve_turns(
 				var volley_mp_before: int = attacker.resource_value(SquadUnitStateType.RESOURCE_MP)
 				attacker.spend_resource(SquadUnitStateType.RESOURCE_MP, VOLLEY_MP_COST)
 				var volley_options := {
+					"schedule_index": schedule_index,
 					"target_info": primary_info,
 					"resource_id": SquadUnitStateType.RESOURCE_MP,
 					"resource_before": volley_mp_before,
@@ -173,18 +192,28 @@ static func _resolve_turns(
 						result, turn, phase, phase_index, &"volley_secondary", SKILL_VOLLEY,
 						acting_squad, defending_squad, attacker, first_squad, second_squad, rng,
 						{}, -1, 0, {
+							"schedule_index": schedule_index,
 							"target_info": _explicit_target_info(attacker, target),
 							"resource_id": SquadUnitStateType.RESOURCE_MP,
 							"protection_queues": protection_queues,
 							"volley_role": &"secondary",
 						}
 					)
+				summary_action_kind = &"volley_action"
+				summary_skill_id = SKILL_VOLLEY
+				_finalize_schedule(
+					result, schedule_index, turn_event_start,
+					summary_action_kind, summary_skill_id
+				)
 				continue
 
 		if (
 			attacker.unit_class == SquadUnitStateType.CLASS_WARRIOR
 			and attacker.can_spend_resource(SquadUnitStateType.RESOURCE_TP, COMBO_TP_COST)
 		):
+			summary_action_kind = &"combo_action"
+			summary_skill_id = SKILL_COMBO
+			var combo_target_info := _choose_target(attacker, defending_squad, rng)
 			var combo_formations_before := formation_snapshot(first_squad, second_squad)
 			var combo_tp_before: int = attacker.resource_value(SquadUnitStateType.RESOURCE_TP)
 			attacker.spend_resource(SquadUnitStateType.RESOURCE_TP, COMBO_TP_COST)
@@ -192,16 +221,46 @@ static func _resolve_turns(
 				result, turn, phase, phase_index, &"combo_attack", SKILL_COMBO,
 				acting_squad, defending_squad, attacker, first_squad, second_squad, rng,
 				combo_formations_before, combo_tp_before, COMBO_TP_COST,
-				{"protection_queues": protection_queues}
+				{
+					"schedule_index": schedule_index,
+					"target_info": combo_target_info,
+					"protection_queues": protection_queues,
+				}
 			)
-
-		if not defending_squad.is_alive():
-			_append_skipped_action(result, turn, phase, phase_index, &"normal_attack", &"", &"no_living_enemy")
+			var locked_target = combo_target_info.get("target")
+			if locked_target == null or not locked_target.is_alive():
+				_append_missed_strike(
+					result, schedule_index, turn, phase, phase_index,
+					acting_squad, defending_squad, attacker, locked_target,
+					first_squad, second_squad
+				)
+			else:
+				_resolve_attack(
+					result, turn, phase, phase_index, &"normal_attack", &"",
+					acting_squad, defending_squad, attacker, first_squad, second_squad, rng,
+					{}, -1, 0, {
+						"schedule_index": schedule_index,
+						"target_info": combo_target_info,
+						"protection_queues": protection_queues,
+					}
+				)
+			_finalize_schedule(
+				result, schedule_index, turn_event_start,
+				summary_action_kind, summary_skill_id
+			)
 			continue
+
 		_resolve_attack(
 			result, turn, phase, phase_index, &"normal_attack", &"",
-			acting_squad, defending_squad, attacker, first_squad, second_squad, rng
-			, {}, -1, 0, activation.merged({"protection_queues": protection_queues}, true)
+			acting_squad, defending_squad, attacker, first_squad, second_squad, rng,
+			{}, -1, 0, activation.merged({
+				"schedule_index": schedule_index,
+				"protection_queues": protection_queues,
+			}, true)
+		)
+		_finalize_schedule(
+			result, schedule_index, turn_event_start,
+			summary_action_kind, summary_skill_id
 		)
 	result["combat_phases"].append({
 		"phase": phase,
@@ -230,16 +289,11 @@ static func _resolve_attack(
 	resource_spent: int = 0,
 	options: Dictionary = {}
 ) -> void:
-	var schedule_entry := _schedule_entry(turn, phase, phase_index, action_kind, skill_id)
-	var schedule_index: int = result["turn_schedule"].size()
-	schedule_entry["schedule_index"] = schedule_index
+	var schedule_index: int = options.get("schedule_index", -1)
 	var target_info: Dictionary = options.get("target_info", _choose_target(attacker, defending_squad, rng))
 	var intended_target = target_info["target"]
 	var target = intended_target
 	if target == null:
-		schedule_entry["status"] = &"skipped"
-		schedule_entry["skipped_reason"] = &"no_valid_target"
-		result["turn_schedule"].append(schedule_entry)
 		return
 	var protected_by: StringName = &""
 	var queues: Dictionary = options.get("protection_queues", {})
@@ -288,6 +342,8 @@ static func _resolve_attack(
 		"phase_index": phase_index,
 		"action_kind": action_kind,
 		"skill_id": skill_id,
+		"strike_status": &"hit",
+		"missed": false,
 		"passive_ids": passive_ids,
 		"attacker_squad_id": acting_squad.actor_id,
 		"defender_squad_id": defending_squad.actor_id,
@@ -328,25 +384,104 @@ static func _resolve_attack(
 	}
 	result["events"].append(event)
 	result["action_order"].append([acting_squad.actor_id, attacker.unit_id])
-	schedule_entry["status"] = &"acted"
-	schedule_entry["event_index"] = event_index
-	result["turn_schedule"].append(schedule_entry)
 
 
-static func _append_skipped_action(
-	result: Dictionary,
-	turn: Dictionary,
-	phase: StringName,
-	phase_index: int,
-	action_kind: StringName,
-	skill_id: StringName,
-	reason: StringName
+static func _append_missed_strike(
+	result: Dictionary, schedule_index: int, turn: Dictionary,
+	phase: StringName, phase_index: int, acting_squad, defending_squad,
+	attacker, intended_target, first_squad, second_squad
 ) -> void:
-	var entry := _schedule_entry(turn, phase, phase_index, action_kind, skill_id)
-	entry["schedule_index"] = result["turn_schedule"].size()
+	var target_id: StringName = intended_target.unit_id if intended_target != null else &""
+	var target_class: StringName = intended_target.unit_class if intended_target != null else &""
+	var target_slot: Vector2i = intended_target.slot if intended_target != null else Vector2i.ZERO
+	var target_health: int = intended_target.health if intended_target != null else 0
+	var formations := formation_snapshot(first_squad, second_squad)
+	result["events"].append({
+		"schedule_index": schedule_index,
+		"phase": phase,
+		"phase_index": phase_index,
+		"action_kind": &"combo_miss",
+		"skill_id": SKILL_COMBO,
+		"strike_status": &"missed_dead_target",
+		"missed": true,
+		"passive_ids": [],
+		"attacker_squad_id": acting_squad.actor_id,
+		"defender_squad_id": defending_squad.actor_id,
+		"attacker_unit_id": attacker.unit_id,
+		"defender_unit_id": target_id,
+		"intended_defender_unit_id": target_id,
+		"protected_by_unit_id": &"",
+		"protection_triggered": false,
+		"attacker_class": attacker.unit_class,
+		"defender_class": target_class,
+		"attacker_slot": attacker.slot,
+		"defender_slot": target_slot,
+		"speed": attacker.speed,
+		"base_damage": attacker.attack,
+		"damage_bonus": 0,
+		"damage": 0,
+		"health_before": target_health,
+		"health_after": target_health,
+		"defender_squad_health_before": defending_squad.health,
+		"defender_squad_health_after": defending_squad.health,
+		"target_died": false,
+		"resource_id": SquadUnitStateType.RESOURCE_TP,
+		"resource_before": attacker.resource_value(SquadUnitStateType.RESOURCE_TP),
+		"resource_spent": 0,
+		"resource_gained": 0,
+		"resource_after": attacker.resource_value(SquadUnitStateType.RESOURCE_TP),
+		"activated_skill_id": &"",
+		"volley_role": &"",
+		"preferred_row": attacker.preferred_row(),
+		"selected_row": target_slot.y,
+		"used_fallback_row": false,
+		"used_random_tie": false,
+		"candidate_unit_ids": [target_id] if target_id != &"" else [],
+		"target_rule": &"locked_combo_target_dead",
+		"target_distance": absi(target_slot.x - attacker.slot.x),
+		"formations_before": formations,
+		"formations_after": formations.duplicate(true),
+	})
+
+
+static func _mark_schedule_skipped(
+	result: Dictionary, schedule_index: int, reason: StringName
+) -> void:
+	var entry: Dictionary = result["turn_schedule"][schedule_index]
 	entry["status"] = &"skipped"
 	entry["skipped_reason"] = reason
-	result["turn_schedule"].append(entry)
+	result["turn_schedule"][schedule_index] = entry
+
+
+static func _finalize_schedule(
+	result: Dictionary, schedule_index: int, event_start: int,
+	action_kind: StringName, skill_id: StringName
+) -> void:
+	var entry: Dictionary = result["turn_schedule"][schedule_index]
+	var event_indices: Array = []
+	var intended_targets: Dictionary = {}
+	for event_index in range(event_start, result["events"].size()):
+		var event: Dictionary = result["events"][event_index]
+		if event.get("schedule_index", -1) != schedule_index:
+			continue
+		event_indices.append(event_index)
+		var intended_id: StringName = event.get("intended_defender_unit_id", &"")
+		if intended_id != &"":
+			intended_targets[intended_id] = true
+	var strike_count := event_indices.size()
+	for strike_index in strike_count:
+		var event_index: int = event_indices[strike_index]
+		result["events"][event_index]["strike_index"] = strike_index
+		result["events"][event_index]["strike_count"] = strike_count
+	entry["action_kind"] = action_kind
+	entry["skill_id"] = skill_id
+	entry["status"] = &"acted" if strike_count > 0 else &"skipped"
+	entry["skipped_reason"] = &"" if strike_count > 0 else &"no_valid_target"
+	entry["event_indices"] = event_indices
+	entry["event_index"] = event_indices[0] if strike_count > 0 else -1
+	entry["strike_count"] = strike_count
+	entry["target_count"] = intended_targets.size()
+	result["turn_schedule"][schedule_index] = entry
 
 
 static func _schedule_entry(
@@ -364,6 +499,9 @@ static func _schedule_entry(
 	entry["status"] = &"pending"
 	entry["skipped_reason"] = &""
 	entry["event_index"] = -1
+	entry["event_indices"] = []
+	entry["strike_count"] = 0
+	entry["target_count"] = 0
 	return entry
 
 

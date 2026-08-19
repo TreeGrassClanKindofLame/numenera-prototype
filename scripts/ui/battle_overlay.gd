@@ -33,6 +33,9 @@ var damage_progress := 0.0
 var impact_flash := 0.0
 var target_died := false
 var active_event: Dictionary = {}
+var active_events: Array = []
+var current_strike_index := -1
+var current_action_kind: StringName = &"normal_action"
 var _audio_players: Dictionary = {}
 
 
@@ -51,6 +54,8 @@ func begin_encounter(p_encounter: Dictionary, p_context: Dictionary, p_slow_moti
 	schedule = encounter.get("turn_schedule", []).duplicate(true)
 	current_schedule_index = -1
 	active_event.clear()
+	active_events.clear()
+	current_strike_index = -1
 	_reset_action_visuals()
 	_assign_sides()
 	headline = _context_title()
@@ -62,9 +67,15 @@ func begin_encounter(p_encounter: Dictionary, p_context: Dictionary, p_slow_moti
 	queue_redraw()
 
 
-func preview_action(schedule_entry: Dictionary, event: Dictionary) -> void:
+func preview_action(schedule_entry: Dictionary, events) -> void:
 	current_schedule_index = schedule_entry.get("schedule_index", -1)
-	active_event = event
+	active_events = events.duplicate(true) if events is Array else [events.duplicate(true)]
+	if active_events.is_empty():
+		return
+	active_event = active_events[0]
+	current_strike_index = 0
+	current_action_kind = schedule_entry.get("action_kind", &"normal_action")
+	var event: Dictionary = active_event
 	snapshot = event.get("formations_before", snapshot).duplicate(true)
 	attacker_squad_id = event.get("attacker_squad_id", &"")
 	attacker_unit_id = event.get("attacker_unit_id", &"")
@@ -75,24 +86,37 @@ func preview_action(schedule_entry: Dictionary, event: Dictionary) -> void:
 	impact_flash = 0.0
 	target_died = event.get("target_died", false)
 	var phase_text := "第零回合" if event.get("phase", &"round_one") == &"round_zero" else "第一回合"
-	var action_name := "普通攻击"
-	match event.get("action_kind", &"normal_attack"):
-		&"combo_attack": action_name = "连击"
-		&"volley_primary": action_name = "齐射·主目标"
-		&"volley_secondary": action_name = "齐射·同排目标"
-		&"bullying_attack": action_name = "欺凌"
-	if event.get("activated_skill_id", &"") == &"protect":
-		action_name = "保护启动＋" + action_name
-	if event.get("protection_triggered", false):
-		action_name += "（肉盾代受）"
-	if event.get("passive_ids", []).has(&"bloodied"):
-		action_name += "＋浴血"
+	var action_name := _action_name(current_action_kind)
 	var action_text: String = _target_reason_text(event) if slow_motion else "%s 准备攻击 %s" % [
 		_unit_display_name(attacker_squad_id, attacker_unit_id),
 		_unit_display_name(defender_squad_id, defender_unit_id),
 	]
-	detail_text = "%s｜%s｜%s" % [phase_text, action_name, action_text]
+	detail_text = "%s · %s · %d击 / %d目标｜%s" % [
+		phase_text, action_name,
+		schedule_entry.get("strike_count", active_events.size()),
+		schedule_entry.get("target_count", 1), action_text,
+	]
 	mode = &"battle"
+	queue_redraw()
+
+
+func begin_strike(strike_index: int) -> void:
+	if strike_index < 0 or strike_index >= active_events.size():
+		return
+	current_strike_index = strike_index
+	active_event = active_events[strike_index]
+	snapshot = active_event.get("formations_before", snapshot).duplicate(true)
+	defender_squad_id = active_event.get("defender_squad_id", &"")
+	defender_unit_id = active_event.get("defender_unit_id", &"")
+	attack_progress = 0.0
+	damage_progress = 0.0
+	impact_flash = 0.0
+	target_died = active_event.get("target_died", false)
+	detail_text = "%s发动%s · 第%d/%d击%s" % [
+		_unit_display_name(attacker_squad_id, attacker_unit_id),
+		_action_name(current_action_kind), strike_index + 1, active_events.size(),
+		" · 落空" if active_event.get("missed", false) else "",
+	]
 	queue_redraw()
 
 
@@ -116,6 +140,13 @@ func commit_action(event: Dictionary) -> void:
 	attack_progress = 0.0
 	damage_progress = 1.0
 	impact_flash = 0.0
+	if event.get("missed", false):
+		detail_text = "%s的第%d击落空｜目标已经阵亡" % [
+			_unit_display_name(event.get("attacker_squad_id", &""), event.get("attacker_unit_id", &"")),
+			event.get("strike_index", 0) + 1,
+		]
+		queue_redraw()
+		return
 	var damage_text := "%d" % event.get("damage", 0)
 	if event.get("damage_bonus", 0) > 0:
 		damage_text += "（基础%d＋浴血%d）" % [
@@ -146,6 +177,8 @@ func commit_action(event: Dictionary) -> void:
 func show_skipped_action(schedule_entry: Dictionary) -> void:
 	current_schedule_index = schedule_entry.get("schedule_index", -1)
 	active_event.clear()
+	active_events.clear()
+	current_strike_index = -1
 	_reset_action_visuals()
 	var phase_text := "第零回合" if schedule_entry.get("phase", &"round_one") == &"round_zero" else "第一回合"
 	detail_text = "%s｜%s：%s" % [
@@ -168,6 +201,8 @@ func show_result(p_encounter: Dictionary) -> void:
 	snapshot = encounter.get("formations_after", snapshot).duplicate(true)
 	current_schedule_index = schedule.size()
 	active_event.clear()
+	active_events.clear()
+	current_strike_index = -1
 	_reset_action_visuals()
 	mode = &"result"
 	var first_id: StringName = encounter.get("first_squad_id", &"")
@@ -199,6 +234,8 @@ func end_encounter() -> void:
 	encounter.clear()
 	schedule.clear()
 	active_event.clear()
+	active_events.clear()
+	current_strike_index = -1
 	queue_redraw()
 
 
@@ -224,7 +261,7 @@ func _draw() -> void:
 
 	_draw_formation(top_squad_id, false)
 	_draw_formation(bottom_squad_id, true)
-	_draw_attack_connection()
+	_draw_attack_connections()
 	_draw_action_queue()
 	if mode == &"result":
 		_draw_result_banner()
@@ -265,6 +302,7 @@ func _draw_unit_card(squad_id: StringName, unit: Dictionary, rect: Rect2) -> voi
 	var unit_id: StringName = unit.get("unit_id", &"")
 	var is_attacker: bool = squad_id == attacker_squad_id and unit_id == attacker_unit_id
 	var is_defender: bool = squad_id == defender_squad_id and unit_id == defender_unit_id
+	var is_action_target := _is_action_target(squad_id, unit_id)
 	var card_rect := rect
 	if is_attacker and attack_progress > 0.0:
 		var target_center := _unit_center(defender_squad_id, defender_unit_id)
@@ -280,9 +318,28 @@ func _draw_unit_card(squad_id: StringName, unit: Dictionary, rect: Rect2) -> voi
 	if is_defender and impact_flash > 0.0:
 		card_rect.position.x += sin(impact_flash * PI * 6.0) * 4.0
 	draw_rect(card_rect, color, true)
-	draw_rect(card_rect, Color("ffdf75") if is_attacker else Color("ff6570") if is_defender else Color("71859e"), false, 4.0 if is_attacker or is_defender else 1.0)
+	draw_rect(
+		card_rect,
+		Color("ffdf75") if is_attacker else Color("ff6570") if is_defender else Color("bd5d68") if is_action_target else Color("71859e"),
+		false, 4.0 if is_attacker or is_defender else 2.0 if is_action_target else 1.0
+	)
 	var class_label: String = "木桩" if squad_id == &"dummy" and unit.get("unit_class", &"") == SquadUnitStateType.CLASS_CUSTOM else _class_short(unit.get("unit_class", &""))
-	draw_string(ThemeDB.fallback_font, card_rect.position + Vector2(8.0, 24.0), class_label, HORIZONTAL_ALIGNMENT_LEFT, card_rect.size.x - 16.0, 17, Color.WHITE)
+	draw_string(ThemeDB.fallback_font, card_rect.position + Vector2(8.0, 24.0), class_label, HORIZONTAL_ALIGNMENT_LEFT, card_rect.size.x - 82.0, 17, Color.WHITE)
+	if is_attacker:
+		_draw_action_badge(card_rect, _action_name(current_action_kind), _action_color(current_action_kind))
+	if not alive:
+		draw_string(
+			ThemeDB.fallback_font, card_rect.position + Vector2(0.0, 63.0), "阵亡",
+			HORIZONTAL_ALIGNMENT_CENTER, card_rect.size.x, 18, Color("ff8a8a")
+		)
+		if is_defender and not active_event.is_empty() and damage_progress > 0.0:
+			draw_string(
+				ThemeDB.fallback_font, card_rect.position + Vector2(0.0, 80.0),
+				"第二击落空" if active_event.get("missed", false) else "受到%d伤害" % active_event.get("damage", 0),
+				HORIZONTAL_ALIGNMENT_CENTER, card_rect.size.x, 11,
+				Color("aeb8c6") if active_event.get("missed", false) else Color("ffdc65")
+			)
+		return
 	draw_string(ThemeDB.fallback_font, card_rect.position + Vector2(8.0, 45.0), "攻%d　速%d" % [unit.get("attack", 0), unit.get("speed", 0)], HORIZONTAL_ALIGNMENT_LEFT, card_rect.size.x - 16.0, 12, Color("e1e9f3"))
 	var health_value: float = unit.get("health", 0)
 	if is_defender and not active_event.is_empty() and damage_progress < 1.0:
@@ -310,47 +367,106 @@ func _draw_unit_card(squad_id: StringName, unit: Dictionary, rect: Rect2) -> voi
 		draw_string(ThemeDB.fallback_font, card_rect.position + Vector2(76.0, 76.0), "%s %d/%d" % [String(resource_id).to_upper(), roundi(resource_value), roundi(resource_max)], HORIZONTAL_ALIGNMENT_RIGHT, card_rect.size.x - 84.0, 11, Color.WHITE)
 	else:
 		draw_string(ThemeDB.fallback_font, card_rect.position + Vector2(8.0, 88.0), "HP %d/%d" % [maxi(roundi(health_value), 0), roundi(max_health)], HORIZONTAL_ALIGNMENT_LEFT, card_rect.size.x - 16.0, 12, Color.WHITE)
-	if not alive:
-		draw_rect(card_rect, Color(0.05, 0.05, 0.06, 0.48), true)
-		draw_string(ThemeDB.fallback_font, card_rect.position + Vector2(0.0, 57.0), "阵亡", HORIZONTAL_ALIGNMENT_CENTER, card_rect.size.x, 18, Color("ff8a8a"))
 	if is_defender and not active_event.is_empty() and damage_progress > 0.0:
 		var float_y := lerpf(card_rect.position.y + 12.0, card_rect.position.y - 18.0, damage_progress)
-		draw_string(ThemeDB.fallback_font, Vector2(card_rect.end.x - 52.0, float_y), "-%d" % active_event.get("damage", 0), HORIZONTAL_ALIGNMENT_CENTER, 52.0, 20, Color("ffdc65"))
+		var damage_label := "落空" if active_event.get("missed", false) else "-%d" % active_event.get("damage", 0)
+		draw_string(
+			ThemeDB.fallback_font, Vector2(card_rect.end.x - 58.0, float_y), damage_label,
+			HORIZONTAL_ALIGNMENT_CENTER, 58.0, 20,
+			Color("aeb8c6") if active_event.get("missed", false) else Color("ffdc65")
+		)
 
 
-func _draw_attack_connection() -> void:
-	if active_event.is_empty() or attacker_unit_id == &"" or defender_unit_id == &"":
+func _draw_attack_connections() -> void:
+	if active_events.is_empty() or attacker_unit_id == &"":
 		return
-	var from := _unit_center(attacker_squad_id, attacker_unit_id)
-	var to := _unit_center(defender_squad_id, defender_unit_id)
-	if from == Vector2.ZERO or to == Vector2.ZERO:
+	var attacker_rect := _unit_rect(attacker_squad_id, attacker_unit_id)
+	if attacker_rect.size == Vector2.ZERO:
 		return
-	var alpha := 0.35 + 0.65 * maxf(attack_progress, 0.25)
-	draw_dashed_line(from, to, Color(1.0, 0.82, 0.32, alpha), 3.0, 9.0)
+	var duplicate_totals: Dictionary = {}
+	for event: Dictionary in active_events:
+		var key := "%s/%s" % [event.get("defender_squad_id", &""), event.get("defender_unit_id", &"")]
+		duplicate_totals[key] = duplicate_totals.get(key, 0) + 1
+	var duplicate_indices: Dictionary = {}
+	for index in active_events.size():
+		var event: Dictionary = active_events[index]
+		var target_squad: StringName = event.get("defender_squad_id", &"")
+		var target_unit: StringName = event.get("defender_unit_id", &"")
+		var target_rect := _unit_rect(target_squad, target_unit)
+		if target_rect.size == Vector2.ZERO:
+			continue
+		var attacker_center := attacker_rect.get_center()
+		var target_center := target_rect.get_center()
+		var direction := (target_center - attacker_center).normalized()
+		var from := attacker_center + direction * _rect_edge_distance(attacker_rect, direction)
+		var to := target_center - direction * _rect_edge_distance(target_rect, -direction)
+		var key := "%s/%s" % [target_squad, target_unit]
+		var lane_index: int = duplicate_indices.get(key, 0)
+		duplicate_indices[key] = lane_index + 1
+		var lane_count: int = duplicate_totals[key]
+		var side := direction.rotated(PI * 0.5)
+		var offset := (float(lane_index) - float(lane_count - 1) * 0.5) * 10.0
+		var is_current := index == current_strike_index
+		var color := Color("8f99a8") if event.get("missed", false) else Color("63c9e8") if event.get("protection_triggered", false) else Color("ffd46b")
+		color.a = 0.95 if is_current else 0.48
+		_draw_attack_arrow(from + side * offset, to + side * offset, color, is_current)
+
+
+func _rect_edge_distance(rect: Rect2, direction: Vector2) -> float:
+	var half := rect.size * 0.5
+	var x_distance := INF if absf(direction.x) < 0.001 else half.x / absf(direction.x)
+	var y_distance := INF if absf(direction.y) < 0.001 else half.y / absf(direction.y)
+	return minf(x_distance, y_distance)
+
+
+func _draw_attack_arrow(from: Vector2, to: Vector2, color: Color, emphasized: bool) -> void:
+	var width := 4.0 if emphasized else 2.5
+	draw_dashed_line(from, to, color, width, 9.0)
 	var direction := (to - from).normalized()
 	var side := direction.rotated(PI * 0.5)
-	draw_colored_polygon(PackedVector2Array([to, to - direction * 16.0 + side * 7.0, to - direction * 16.0 - side * 7.0]), Color(1.0, 0.82, 0.32, alpha))
+	draw_colored_polygon(PackedVector2Array([
+		to, to - direction * 16.0 + side * 7.0,
+		to - direction * 16.0 - side * 7.0,
+	]), color)
+
+
+func _is_action_target(squad_id: StringName, unit_id: StringName) -> bool:
+	for event: Dictionary in active_events:
+		if (
+			event.get("defender_squad_id", &"") == squad_id
+			and event.get("defender_unit_id", &"") == unit_id
+		):
+			return true
+	return false
+
+
+func _draw_action_badge(card_rect: Rect2, label: String, color: Color) -> void:
+	var width := clampf(22.0 + ThemeDB.fallback_font.get_string_size(label, HORIZONTAL_ALIGNMENT_LEFT, -1, 11).x, 48.0, 76.0)
+	var rect := Rect2(card_rect.end.x - width - 7.0, card_rect.position.y + 7.0, width, 22.0)
+	draw_rect(rect, Color(color, 0.22), true)
+	draw_rect(rect, color, false, 1.5)
+	draw_string(ThemeDB.fallback_font, rect.position + Vector2(0.0, 15.0), label, HORIZONTAL_ALIGNMENT_CENTER, rect.size.x, 11, Color.WHITE)
 
 
 func _draw_action_queue() -> void:
 	var y := 164.0
-	const VISIBLE_ACTIONS := 9
+	const VISIBLE_ACTIONS := 8
 	var first_visible := 0
 	if schedule.size() > VISIBLE_ACTIONS:
 		first_visible = clampi(current_schedule_index - int(VISIBLE_ACTIONS / 2), 0, schedule.size() - VISIBLE_ACTIONS)
 	var last_visible := mini(first_visible + VISIBLE_ACTIONS, schedule.size())
 	for index in range(first_visible, last_visible):
 		var entry: Dictionary = schedule[index]
-		var rect := Rect2(904.0, y, 218.0, 40.0)
+		var rect := Rect2(904.0, y, 218.0, 48.0)
 		var state := &"pending"
 		if index < current_schedule_index:
 			state = entry.get("status", &"acted")
 		elif index == current_schedule_index:
 			state = &"current"
-		var background := Color("1b2b3d")
+		var background := Color("172536")
 		var text_color := Color("dce7f4")
 		if state == &"current":
-			background = Color("5c4d25")
+			background = Color("273548")
 			text_color = Color("ffe78d")
 		elif state == &"acted":
 			background = Color("17212e")
@@ -359,20 +475,30 @@ func _draw_action_queue() -> void:
 			background = Color("281d25")
 			text_color = Color("cf7880")
 		draw_rect(rect, background, true)
-		draw_rect(rect, Color("3b516b"), false, 1.0)
+		draw_rect(rect, Color("f1c85b") if state == &"current" else Color("3b516b"), false, 2.0 if state == &"current" else 1.0)
+		if state == &"current":
+			draw_rect(Rect2(rect.position, Vector2(4.0, rect.size.y)), Color("f1c85b"), true)
 		var prefix := "▶" if state == &"current" else "×" if state == &"skipped" else "✓" if state == &"acted" else "%d" % (index + 1)
 		var phase_mark := "零" if entry.get("phase", &"round_one") == &"round_zero" else "一"
-		var action_mark := "攻"
-		match entry.get("action_kind", &"normal_attack"):
-			&"combo_attack": action_mark = "连"
-			&"volley_primary": action_mark = "齐主"
-			&"volley_secondary": action_mark = "齐次"
-			&"bullying_attack": action_mark = "欺"
-		var label := "%s[%s·%s] %s　速%d" % [prefix, phase_mark, action_mark, _unit_display_name(entry.get("squad_id", &""), entry.get("unit_id", &"")), entry.get("speed", 0)]
-		draw_string(ThemeDB.fallback_font, rect.position + Vector2(8.0, 17.0), label, HORIZONTAL_ALIGNMENT_LEFT, 202.0, 12, text_color)
+		var action_kind: StringName = entry.get("action_kind", &"normal_action")
+		var action_name := _action_name(action_kind)
+		var action_color := _action_color(action_kind)
+		var badge_rect := Rect2(rect.position + Vector2(25.0, 6.0), Vector2(52.0, 18.0))
+		draw_rect(badge_rect, Color(action_color, 0.24), true)
+		draw_rect(badge_rect, action_color, false, 1.0)
+		draw_string(ThemeDB.fallback_font, badge_rect.position + Vector2(0.0, 13.0), action_name, HORIZONTAL_ALIGNMENT_CENTER, badge_rect.size.x, 10, text_color)
+		draw_string(ThemeDB.fallback_font, rect.position + Vector2(8.0, 19.0), prefix, HORIZONTAL_ALIGNMENT_LEFT, 16.0, 12, text_color)
+		draw_string(
+			ThemeDB.fallback_font, rect.position + Vector2(84.0, 19.0),
+			_unit_display_name(entry.get("squad_id", &""), entry.get("unit_id", &"")),
+			HORIZONTAL_ALIGNMENT_LEFT, 126.0, 12, text_color
+		)
+		var count_text := "%d目标" % entry.get("target_count", 0) if entry.get("target_count", 0) > 1 else "%d击" % entry.get("strike_count", 0)
+		var meta := "第%s回合 · 速%d · %s" % [phase_mark, entry.get("speed", 0), count_text]
+		draw_string(ThemeDB.fallback_font, rect.position + Vector2(25.0, 39.0), meta, HORIZONTAL_ALIGNMENT_LEFT, 184.0, 10, Color("aebdce") if state != &"current" else Color("ffe7a0"))
 		if state == &"skipped":
-			draw_string(ThemeDB.fallback_font, rect.position + Vector2(8.0, 34.0), _skip_reason_text(entry.get("skipped_reason", &"")), HORIZONTAL_ALIGNMENT_LEFT, 202.0, 10, text_color)
-		y += 46.0
+			draw_string(ThemeDB.fallback_font, rect.position + Vector2(112.0, 39.0), _skip_reason_text(entry.get("skipped_reason", &"")), HORIZONTAL_ALIGNMENT_RIGHT, 96.0, 10, text_color)
+		y += 55.0
 
 
 func _draw_result_banner() -> void:
@@ -422,14 +548,41 @@ func _unit_center(squad_id: StringName, unit_id: StringName) -> Vector2:
 	return Vector2.ZERO
 
 
+func _unit_rect(squad_id: StringName, unit_id: StringName) -> Rect2:
+	if squad_id == &"" or not snapshot.has(squad_id):
+		return Rect2()
+	for unit: Dictionary in snapshot[squad_id]:
+		if unit.get("unit_id", &"") == unit_id:
+			return _slot_rect(unit["slot"], squad_id == bottom_squad_id)
+	return Rect2()
+
+
 func _context_title() -> String:
-	return "第%d波　｜　同步冲突点 %d/%d　｜　乱战配对 %d/%d　｜　表现依次回放，逻辑同时结算" % [
+	return "第%d波 · 冲突点 %d/%d · 配对 %d/%d" % [
 		context.get("wave_index", 0) + 1,
 		context.get("group_index", 0) + 1,
 		maxi(context.get("group_count", 1), 1),
 		context.get("pair_index", 0) + 1,
 		maxi(context.get("pair_count", 1), 1),
 	]
+
+
+func _action_name(action_kind: StringName) -> String:
+	match action_kind:
+		&"combo_action": return "连击"
+		&"volley_action": return "齐射"
+		&"bullying_action": return "欺凌"
+		&"protect_action": return "保护"
+	return "普通攻击"
+
+
+func _action_color(action_kind: StringName) -> Color:
+	match action_kind:
+		&"combo_action": return Color("f0a64b")
+		&"volley_action": return Color("e4c757")
+		&"bullying_action": return Color("b778e8")
+		&"protect_action": return Color("5ac3df")
+	return Color("6e9ed6")
 
 
 func _engagement_summary() -> String:
@@ -516,7 +669,7 @@ func _squad_display_name(squad_id: StringName) -> String:
 		&"dummy": return "木桩小队"
 		&"robot": return "机器人小队"
 		&"bandit": return "强盗小队"
-	return String(squad_id)
+	return "主角小队" if _controller_for(squad_id) == &"player" else "敌方小队"
 
 
 func _skip_reason_text(reason: StringName) -> String:

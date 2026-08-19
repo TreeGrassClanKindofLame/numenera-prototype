@@ -400,10 +400,16 @@ func _play_squad_encounter(encounter: Dictionary, context: Dictionary) -> void:
 			_battle_overlay.show_skipped_action(schedule_entry)
 			await get_tree().create_timer(COMBAT_PREVIEW_DURATION).timeout
 			continue
-		var event_index: int = schedule_entry.get("event_index", -1)
-		if event_index < 0 or event_index >= events.size():
+		var event_indices: Array = schedule_entry.get("event_indices", [])
+		if event_indices.is_empty() and schedule_entry.get("event_index", -1) >= 0:
+			event_indices = [schedule_entry["event_index"]]
+		var action_events: Array = []
+		for event_index: int in event_indices:
+			if event_index >= 0 and event_index < events.size():
+				action_events.append(events[event_index])
+		if action_events.is_empty():
 			continue
-		await _play_unit_battle_action(schedule_entry, events[event_index])
+		await _play_unit_battle_action(schedule_entry, action_events)
 	_battle_overlay.show_result(encounter)
 	_battle_overlay.play_audio_cue(&"result")
 	if _battle_slow_motion_enabled:
@@ -412,29 +418,31 @@ func _play_squad_encounter(encounter: Dictionary, context: Dictionary) -> void:
 		await get_tree().create_timer(RESULT_HOLD_DURATION).timeout
 
 
-func _play_unit_battle_action(schedule_entry: Dictionary, event: Dictionary) -> void:
-	_battle_overlay.preview_action(schedule_entry, event)
+func _play_unit_battle_action(schedule_entry: Dictionary, action_events: Array) -> void:
+	_battle_overlay.preview_action(schedule_entry, action_events)
 	if _battle_slow_motion_enabled:
 		await _wait_for_combat_step("战斗慢放｜按空格结算当前单位行动")
 	else:
 		await get_tree().create_timer(COMBAT_PREVIEW_DURATION).timeout
 
-	_battle_overlay.play_audio_cue(&"attack")
-	var strike := create_tween()
-	strike.tween_method(_battle_overlay.set_attack_progress, 0.0, 1.0, COMBAT_STRIKE_DURATION)
-	await strike.finished
-
-	_battle_overlay.play_audio_cue(&"hit")
-	var impact := create_tween()
-	impact.tween_method(_battle_overlay.set_impact_flash, 1.0, 0.0, COMBAT_IMPACT_DURATION)
-	await impact.finished
-
-	var damage := create_tween()
-	damage.tween_method(_battle_overlay.set_damage_progress, 0.0, 1.0, COMBAT_DAMAGE_DURATION)
-	await damage.finished
-	if event.get("target_died", false):
-		_battle_overlay.play_audio_cue(&"death")
-	_battle_overlay.commit_action(event)
+	for strike_index in action_events.size():
+		var event: Dictionary = action_events[strike_index]
+		_battle_overlay.begin_strike(strike_index)
+		_battle_overlay.play_audio_cue(&"attack")
+		var strike := create_tween()
+		strike.tween_method(_battle_overlay.set_attack_progress, 0.0, 1.0, COMBAT_STRIKE_DURATION)
+		await strike.finished
+		if not event.get("missed", false):
+			_battle_overlay.play_audio_cue(&"hit")
+			var impact := create_tween()
+			impact.tween_method(_battle_overlay.set_impact_flash, 1.0, 0.0, COMBAT_IMPACT_DURATION)
+			await impact.finished
+		var damage := create_tween()
+		damage.tween_method(_battle_overlay.set_damage_progress, 0.0, 1.0, COMBAT_DAMAGE_DURATION)
+		await damage.finished
+		if event.get("target_died", false):
+			_battle_overlay.play_audio_cue(&"death")
+		_battle_overlay.commit_action(event)
 
 
 func _play_combat_event_batch(events: Array) -> void:
@@ -451,7 +459,7 @@ func _play_combat_event_batch(events: Array) -> void:
 		}
 		_battle_overlay.snapshot = event.get("formations_before", {}).duplicate(true)
 		_battle_overlay.show()
-		await _play_unit_battle_action(schedule_entry, event)
+		await _play_unit_battle_action(schedule_entry, [event])
 
 
 func _wait_for_combat_step(prompt := "战斗慢放｜按空格结算当前单位行动") -> void:

@@ -54,6 +54,7 @@ func _run_all() -> void:
 	await _test_main_scene_gm_panel_and_combat()
 	await _test_enemy_scenario_switching_and_debug()
 	await _test_focused_stage_auto_playback()
+	await _test_multi_strike_overlay_visual()
 	await _test_slow_motion_requires_one_step_per_action()
 	# Let queued scene/audio frees reach the ObjectDB before the command-line
 	# runner exits; otherwise the fast Compatibility run reports transient leaks.
@@ -61,7 +62,7 @@ func _run_all() -> void:
 	await get_tree().create_timer(0.15).timeout
 
 	if _failures == 0:
-		print("PASS: %d checks across 37 squad-combat scenarios." % _checks)
+		print("PASS: %d checks across 39 squad-combat scenarios." % _checks)
 		get_tree().quit(0)
 	else:
 		push_error("FAIL: %d of %d checks failed." % [_failures, _checks])
@@ -125,6 +126,8 @@ func _test_tp_combo_and_bloodied_rules() -> void:
 		if event["attacker_unit_id"] == &"w":
 			warrior_attacks.append(event)
 	_expect_equal(warrior_attacks.size(), 2, "four TP triggers exactly one extra attack in a scheduled turn")
+	_expect_equal(result["turn_schedule"][0]["action_kind"], &"combo_action", "combo uses one summarized unit-turn queue entry")
+	_expect_equal(result["turn_schedule"][0]["event_indices"].size(), 2, "combo queue entry owns both strike events")
 	_expect_equal(warrior_attacks[0]["action_kind"], &"combo_attack", "combo attack resolves before the planned attack")
 	_expect_equal([warrior_attacks[0]["damage"], warrior_attacks[1]["damage"]], [3, 3], "bloodied adds damage to combo and normal attacks")
 	_expect_equal(warriors.unit_by_id(&"w").resource_value(&"tp"), 2, "combo spends four TP and both attacks recharge one")
@@ -142,6 +145,17 @@ func _test_tp_combo_and_bloodied_rules() -> void:
 			combo_count += 1
 	_expect_equal(combo_count, 1, "four-point combo cannot retrigger in round one after a round-zero combo")
 	_expect_equal(repeated.unit_by_id(&"rw").resource_value(&"tp"), 4, "one combo and three attacks leave the expected TP")
+	var lethal_combo_unit = _unit(&"lethal_combo", &"warrior", 1, 0, 10, 5, 5)
+	lethal_combo_unit.gain_resource(&"tp", 4)
+	var lethal_combo = _squad(&"lethal_combo_squad", &"player", &"player", Vector2i.ZERO, [lethal_combo_unit])
+	var remaining_targets = _squad(&"remaining_targets", &"enemy", &"npc", Vector2i.ZERO, [
+		_unit(&"doomed_target", &"custom", 1, 0, 3, 0, 1),
+		_unit(&"other_target", &"custom", 2, 0, 20, 0, 1),
+	])
+	var lethal_combo_result := _battle(lethal_combo, remaining_targets, 721)
+	_expect_true(lethal_combo_result["events"][1]["missed"], "combo second strike misses after its locked target dies")
+	_expect_equal(remaining_targets.unit_by_id(&"other_target").health, 20, "missed combo strike never transfers to another target")
+	_expect_equal(lethal_combo.unit_by_id(&"lethal_combo").resource_value(&"tp"), 1, "missed combo strike grants no attack TP")
 
 	var half_unit = _unit(&"half", &"warrior", 1, 0, 4, 2, 5)
 	half_unit.health = 2
@@ -256,6 +270,8 @@ func _test_volley_and_protection_auto_skills() -> void:
 	var volley := _battle(archers, line, 904)
 	var volley_events: Array = volley["events"].filter(func(event): return event.get("skill_id", &"") == &"volley")
 	_expect_equal(volley_events.size(), 3, "volley attacks the primary and every other living unit in its row")
+	_expect_equal(volley["turn_schedule"][0]["action_kind"], &"volley_action", "volley uses one summarized unit-turn queue entry")
+	_expect_equal(volley["turn_schedule"][0]["event_indices"].size(), 3, "volley queue entry owns all target strikes")
 	_expect_equal(archers.unit_by_id(&"bow").resource_value(&"mp"), 2, "volley spends three MP once")
 	var solo_archer = _squad(&"solo_archer", &"player", &"player", Vector2i.ZERO, [
 		_unit(&"solo_bow", &"archer", 1, 0, 3, 2, 5),
@@ -1027,9 +1043,9 @@ func _test_focused_stage_auto_playback() -> void:
 	var main = MainScene.instantiate()
 	add_child(main)
 	await get_tree().process_frame
-	var first = _squad(&"player", &"player", &"player", Vector2i.ZERO, [
-		_unit(&"p", &"warrior", 1, 0, 5, 2, 2),
-	])
+	var slow_warrior = _unit(&"p", &"warrior", 1, 0, 5, 2, 2)
+	slow_warrior.gain_resource(&"tp", 4)
+	var first = _squad(&"player", &"player", &"player", Vector2i.ZERO, [slow_warrior])
 	var second = _squad(&"enemy", &"enemy", &"npc", Vector2i.ZERO, [
 		_unit(&"e", &"tank", 1, 0, 8, 1, 1),
 	])
@@ -1041,7 +1057,7 @@ func _test_focused_stage_auto_playback() -> void:
 	})
 	await get_tree().process_frame
 	_expect_true(main._battle_overlay.visible, "focused battle stage stays visible during encounter")
-	_expect_true(main._battle_overlay.headline.contains("同步冲突点 1/2"), "stage identifies sequential replay inside simultaneous wave")
+	_expect_true(main._battle_overlay.headline.contains("冲突点 1/2"), "stage identifies sequential replay inside simultaneous wave")
 	_expect_true(not main._waiting_for_combat_step, "automatic playback never waits for space")
 	_capture_viewport("res://.godot/focused_stage_preview.png", "focused battle stage can be captured")
 	await get_tree().create_timer(main.COMBAT_EVENT_DURATION * 3.0 + main.RESULT_HOLD_DURATION).timeout
@@ -1060,13 +1076,14 @@ func _test_slow_motion_requires_one_step_per_action() -> void:
 	main._slow_motion_toggle.button_pressed = true
 	_expect_true(main._battle_slow_motion_enabled, "GM toggle enables slow battle")
 
-	var first = _squad(&"player", &"player", &"player", Vector2i.ZERO, [
-		_unit(&"p", &"warrior", 1, 0, 5, 2, 2),
-	])
+	var slow_motion_warrior = _unit(&"p", &"warrior", 1, 0, 5, 2, 2)
+	slow_motion_warrior.gain_resource(&"tp", 4)
+	var first = _squad(&"player", &"player", &"player", Vector2i.ZERO, [slow_motion_warrior])
 	var second = _squad(&"dummy", &"dummy", &"npc", Vector2i.ZERO, [
 		_unit(&"d", &"tank", 1, 0, 8, 1, 1),
 	])
 	var encounter := _battle(first, second, 62, 1, 0)
+	_expect_equal(encounter["turn_schedule"][0]["event_indices"].size(), 2, "slow-motion fixture starts with a two-strike combo in one queue entry")
 	main._play_squad_encounter(encounter, {
 		"wave_index": 0, "group_index": 0, "group_count": 1,
 		"pair_index": 0, "pair_count": 1,
@@ -1075,7 +1092,7 @@ func _test_slow_motion_requires_one_step_per_action() -> void:
 	_expect_true(main._waiting_for_combat_step, "slow battle pauses before first action resolves")
 	_expect_true(main._battle_overlay.detail_text.contains("第零回合"), "slow battle identifies the round-zero action")
 	main._advance_slow_battle()
-	await get_tree().create_timer(main.COMBAT_EVENT_DURATION * 1.2).timeout
+	await get_tree().create_timer(main.COMBAT_EVENT_DURATION * 2.2).timeout
 	_expect_true(main._waiting_for_combat_step, "round one pauses after the round-zero action")
 	main._advance_slow_battle()
 	await get_tree().create_timer(main.COMBAT_EVENT_DURATION * 1.2).timeout
@@ -1087,6 +1104,63 @@ func _test_slow_motion_requires_one_step_per_action() -> void:
 	main._advance_slow_battle()
 	await get_tree().process_frame
 	_expect_true(not main._waiting_for_combat_step, "extra space confirms result and releases encounter")
+	main._battle_overlay.end_encounter()
+	main.queue_free()
+	await get_tree().process_frame
+
+
+func _test_multi_strike_overlay_visual() -> void:
+	var main = MainScene.instantiate()
+	add_child(main)
+	await get_tree().process_frame
+	var archer = _squad(&"player", &"player", &"player", Vector2i.ZERO, [
+		_unit(&"bow_visual", &"archer", 1, 1, 3, 1, 5),
+	])
+	var row_targets = _squad(&"enemy", &"enemy", &"npc", Vector2i.ZERO, [
+		_unit(&"left_visual", &"custom", 0, 0, 10, 0, 1),
+		_unit(&"middle_visual", &"custom", 1, 0, 10, 0, 1),
+		_unit(&"right_visual", &"custom", 2, 0, 10, 0, 1),
+	])
+	var volley := _battle(archer, row_targets, 920)
+	var volley_entry: Dictionary = volley["turn_schedule"][0]
+	var volley_events: Array = []
+	for event_index: int in volley_entry["event_indices"]:
+		volley_events.append(volley["events"][event_index])
+	main._battle_overlay.begin_encounter(volley, {
+		"wave_index": 0, "group_index": 0, "group_count": 1,
+		"pair_index": 0, "pair_count": 1,
+	}, false)
+	main._battle_overlay.preview_action(volley_entry, volley_events)
+	main._battle_overlay.begin_strike(0)
+	main._battle_overlay.set_attack_progress(1.0)
+	await get_tree().process_frame
+	_expect_equal(main._battle_overlay.active_events.size(), 3, "volley overlay receives all three strikes as one action")
+	_expect_equal(main._battle_overlay.current_action_kind, &"volley_action", "volley overlay exposes the summarized action name")
+	_capture_viewport("res://.godot/multi_strike_stage_preview.png", "multi-target volley overlay can be captured")
+
+	var combo_unit = _unit(&"combo_visual", &"warrior", 1, 0, 10, 5, 5)
+	combo_unit.gain_resource(&"tp", 4)
+	var combo_squad = _squad(&"player", &"player", &"player", Vector2i.ZERO, [combo_unit])
+	var combo_targets = _squad(&"enemy", &"enemy", &"npc", Vector2i.ZERO, [
+		_unit(&"combo_doomed", &"custom", 1, 0, 3, 0, 1),
+		_unit(&"combo_other", &"custom", 2, 0, 20, 0, 1),
+	])
+	var combo := _battle(combo_squad, combo_targets, 921)
+	var combo_entry: Dictionary = combo["turn_schedule"][0]
+	var combo_events: Array = []
+	for event_index: int in combo_entry["event_indices"]:
+		combo_events.append(combo["events"][event_index])
+	main._battle_overlay.begin_encounter(combo, {
+		"wave_index": 0, "group_index": 0, "group_count": 1,
+		"pair_index": 0, "pair_count": 1,
+	}, false)
+	main._battle_overlay.preview_action(combo_entry, combo_events)
+	main._battle_overlay.begin_strike(1)
+	main._battle_overlay.set_attack_progress(1.0)
+	main._battle_overlay.set_damage_progress(1.0)
+	await get_tree().process_frame
+	_expect_true(main._battle_overlay.active_event.get("missed", false), "combo overlay represents the second locked strike as missed")
+	_capture_viewport("res://.godot/combo_miss_stage_preview.png", "combo miss overlay can be captured")
 	main._battle_overlay.end_encounter()
 	main.queue_free()
 	await get_tree().process_frame
