@@ -29,6 +29,9 @@ const COLLISION_STAGING_DISTANCE := 11.0
 const RNG_SEED := 1337
 const UNIT_CLASS_CYCLE := [&"", &"tank", &"warrior", &"archer", &"assassin"]
 const SKILL_BANDAGE := &"bandage"
+const SKILL_FIRST_STRIKE := &"first_strike"
+const SKILL_TRAP := &"trap"
+const SKILL_GUARD := &"guard"
 
 const COLOR_BACKGROUND := Color("111722")
 const COLOR_FLOOR_A := Color("202b3a")
@@ -53,6 +56,7 @@ var _enemy_brains: Dictionary = {}
 var _enemy_ai = EnemyAIControllerType.new()
 var _scenario_id: StringName = ScenarioCatalogType.SCENARIO_DUMMY
 var _scenario: Dictionary = {}
+var _map_effects: Dictionary = {"traps": []}
 var _turn_number := 1
 var _busy := false
 
@@ -73,6 +77,8 @@ var _squad_selector_ids: Array = []
 var _squad_selector_buttons: Array = []
 var _bandage_button: Button
 var _bandage_targeting := false
+var _grid_skill_buttons: Dictionary = {}
+var _selected_grid_skill: StringName = &""
 
 
 func _ready() -> void:
@@ -102,10 +108,10 @@ func _unhandled_input(event: InputEvent) -> void:
 		return
 	if _busy or not _actors.has(&"player"):
 		return
-	if _bandage_targeting:
+	if _selected_grid_skill != &"":
 		if key_event.keycode == KEY_ESCAPE:
 			get_viewport().set_input_as_handled()
-			_cancel_bandage_targeting()
+			_cancel_grid_skill_targeting()
 		return
 
 	var player_intent = null
@@ -131,7 +137,8 @@ func _play_turn(player_intent) -> void:
 		return
 	_busy = true
 	_bandage_targeting = false
-	_refresh_bandage_button()
+	_selected_grid_skill = &""
+	_refresh_grid_skill_buttons()
 	_set_slow_motion_toggle_locked(true)
 	_set_scenario_controls_locked(true)
 	_update_interface("正在结算第 %d 回合…" % _turn_number, _log_label.text)
@@ -156,8 +163,10 @@ func _play_turn(player_intent) -> void:
 
 	var resolved_turn := _turn_number
 	var resolution = TurnResolverType.resolve(
-		BOARD_SIZE, _blocked, actor_states, intents, RNG_SEED + resolved_turn
+		BOARD_SIZE, _blocked, actor_states, intents, RNG_SEED + resolved_turn,
+		_map_effects
 	)
+	_map_effects = resolution.final_map_effects.duplicate(true)
 	for actor_id: StringName in _enemy_brains.keys():
 		if not _enemy_brains.has(actor_id):
 			continue
@@ -213,6 +222,7 @@ func _play_resolution_animation(
 		APPROACH_DURATION
 	)
 	await approach.finished
+	await _play_trap_events(resolution.trap_events)
 
 	for wave_index in resolution.collision_waves.size():
 		var wave: Dictionary = resolution.collision_waves[wave_index]
@@ -224,20 +234,46 @@ func _play_resolution_animation(
 	await _play_grid_skill_events(resolution.grid_skill_events)
 
 
+func _play_trap_events(events: Array) -> void:
+	for event: Dictionary in events:
+		var actor_id: StringName = event.get("actor_id", &"")
+		if not _actor_views.has(actor_id):
+			continue
+		var view = _actor_views[actor_id]
+		view.set_health(event.get("health_after", view.health))
+		var pulse := create_tween()
+		pulse.tween_property(view, "modulate", Color("ff725f"), SETTLE_DURATION * 0.5)
+		pulse.tween_property(view, "modulate", Color.WHITE, SETTLE_DURATION * 0.5)
+		await pulse.finished
+
+
 func _play_grid_skill_events(events: Array) -> void:
 	for event: Dictionary in events:
-		if event.get("skill_id", &"") != SKILL_BANDAGE:
-			continue
 		var actor_id: StringName = event.get("actor_id", &"")
 		if event.get("status", &"") != &"resolved" or not _actor_views.has(actor_id):
 			continue
-		var total_heal := 0
-		for heal: Dictionary in event.get("heals", []):
-			total_heal += heal.get("amount", 0)
+		var skill_id: StringName = event.get("skill_id", &"")
 		var view = _actor_views[actor_id]
-		view.set_health(view.health + total_heal)
+		var pulse_color := Color("8dffae")
+		if skill_id == SKILL_BANDAGE:
+			var total_heal := 0
+			for heal: Dictionary in event.get("heals", []):
+				total_heal += heal.get("amount", 0)
+			view.set_health(view.health + total_heal)
+		elif skill_id == SKILL_FIRST_STRIKE:
+			pulse_color = Color("ffcf70")
+			var target_id: StringName = event.get("target_actor_id", &"")
+			if _actor_views.has(target_id):
+				var total_damage := 0
+				for damage: Dictionary in event.get("damages", []):
+					total_damage += damage.get("amount", 0)
+				_actor_views[target_id].set_health(_actor_views[target_id].health - total_damage)
+		elif skill_id == SKILL_TRAP:
+			pulse_color = Color("cc7cff")
+		elif skill_id == SKILL_GUARD:
+			pulse_color = Color("79c7ff")
 		var pulse := create_tween()
-		pulse.tween_property(view, "modulate", Color("8dffae"), SETTLE_DURATION * 0.5)
+		pulse.tween_property(view, "modulate", pulse_color, SETTLE_DURATION * 0.5)
 		pulse.parallel().tween_property(view, "scale", Vector2.ONE * 1.12, SETTLE_DURATION * 0.5)
 		pulse.tween_property(view, "modulate", Color.WHITE, SETTLE_DURATION * 0.5)
 		pulse.parallel().tween_property(view, "scale", Vector2.ONE, SETTLE_DURATION * 0.5)
@@ -485,6 +521,7 @@ func _parse_map() -> void:
 	_blocked.clear()
 	_actors.clear()
 	_enemy_brains.clear()
+	_map_effects = {"traps": []}
 	var map_rows: Array = _scenario.get("map_rows", [])
 	for y in BOARD_SIZE.y:
 		var row: String = map_rows[y]
@@ -671,11 +708,16 @@ func _build_interface() -> void:
 	_ai_debug_toggle.button_pressed = true
 	_ai_debug_toggle.toggled.connect(_on_ai_debug_toggled)
 	add_child(_ai_debug_toggle)
-	_bandage_button = Button.new()
-	_bandage_button.position = Vector2(960.0, 350.0)
-	_bandage_button.size = Vector2(208.0, 40.0)
-	_bandage_button.pressed.connect(_on_bandage_pressed)
-	add_child(_bandage_button)
+	for index in 4:
+		var skill_id: StringName = [SKILL_BANDAGE, SKILL_FIRST_STRIKE, SKILL_TRAP, SKILL_GUARD][index]
+		var skill_button := Button.new()
+		skill_button.position = Vector2(960.0 + (index % 2) * 104.0, 350.0 + (index / 2) * 42.0)
+		skill_button.size = Vector2(100.0, 36.0)
+		skill_button.add_theme_font_size_override("font_size", 12)
+		skill_button.pressed.connect(_on_grid_skill_pressed.bind(skill_id))
+		_grid_skill_buttons[skill_id] = skill_button
+		add_child(skill_button)
+	_bandage_button = _grid_skill_buttons[SKILL_BANDAGE]
 	_build_formation_panel()
 	add_child(_make_label(
 		"上一回合",
@@ -721,7 +763,7 @@ func _build_formation_panel() -> void:
 			add_child(button)
 	_refresh_squad_selectors()
 	_refresh_formation_panel()
-	_refresh_bandage_button()
+	_refresh_grid_skill_buttons()
 
 
 func _build_scenario_controls() -> void:
@@ -750,6 +792,7 @@ func _switch_scenario(scenario_id: StringName) -> void:
 	_turn_number = 1
 	_selected_squad_id = &"player"
 	_bandage_targeting = false
+	_selected_grid_skill = &""
 	_parse_map()
 	_build_actor_views()
 	_refresh_squad_selectors()
@@ -802,8 +845,8 @@ func _select_formation_squad(actor_id: StringName) -> void:
 func _cycle_formation_slot(slot: Vector2i) -> void:
 	if _busy or not _actors.has(_selected_squad_id):
 		return
-	if _bandage_targeting:
-		_confirm_bandage_source(slot)
+	if _selected_grid_skill != &"":
+		_confirm_grid_skill_source(slot)
 		return
 	var squad = _actors[_selected_squad_id]
 	var existing = squad.unit_at(slot)
@@ -842,6 +885,12 @@ func _refresh_formation_panel() -> void:
 				row_name, slot.x + 1, unit_name,
 				maxi(unit.health, 0), unit.attack, unit.speed,
 			]
+			var marker := ""
+			if unit.is_guard_armed():
+				marker = "｜戒备"
+			elif unit.has_used_grid_skill(_class_grid_skill(unit.unit_class)):
+				marker = "｜已用"
+			button.text += marker
 			var resource_id := _unit_resource_id(unit)
 			if resource_id == &"":
 				resource_bar.hide()
@@ -877,10 +926,11 @@ func _refresh_formation_panel() -> void:
 				resource_label.show()
 		button.modulate = (
 			Color("8dffae")
-			if _bandage_targeting and unit != null and _can_source_bandage(unit)
+			if _selected_grid_skill != &"" and unit != null
+			and _can_source_grid_skill(unit, _selected_grid_skill)
 			else Color.WHITE
 		)
-	_refresh_bandage_button()
+	_refresh_grid_skill_buttons()
 
 
 func _unit_resource_id(unit) -> StringName:
@@ -891,77 +941,135 @@ func _unit_resource_id(unit) -> StringName:
 
 
 func _on_bandage_pressed() -> void:
+	_on_grid_skill_pressed(SKILL_BANDAGE)
+
+
+func _on_grid_skill_pressed(skill_id: StringName) -> void:
 	if _busy or not _actors.has(&"player"):
 		return
-	if _bandage_targeting:
-		_cancel_bandage_targeting()
+	if _selected_grid_skill == skill_id:
+		_cancel_grid_skill_targeting()
 		return
-	if not _bandage_available():
+	if not _grid_skill_available(skill_id):
 		return
-	_bandage_targeting = true
+	_selected_grid_skill = skill_id
+	_bandage_targeting = skill_id == SKILL_BANDAGE
 	_selected_squad_id = &"player"
-	_status_label.text = "包扎｜请选择一名存活战士（再次点击技能或 Esc 取消）"
+	_status_label.text = "%s｜请选择一名可用单位（再次点击技能或 Esc 取消）" % _grid_skill_name(skill_id)
 	_refresh_formation_panel()
 
 
 func _cancel_bandage_targeting() -> void:
+	_cancel_grid_skill_targeting()
+
+
+func _cancel_grid_skill_targeting() -> void:
 	_bandage_targeting = false
+	_selected_grid_skill = &""
 	_status_label.text = "等待玩家输入"
 	_refresh_formation_panel()
 
 
 func _confirm_bandage_source(slot: Vector2i) -> void:
+	_selected_grid_skill = SKILL_BANDAGE
+	_confirm_grid_skill_source(slot)
+
+
+func _confirm_grid_skill_source(slot: Vector2i) -> void:
 	if not _actors.has(&"player"):
-		_cancel_bandage_targeting()
+		_cancel_grid_skill_targeting()
 		return
 	var unit = _actors[&"player"].unit_at(slot)
-	if not _bandage_available() or unit == null or not _can_source_bandage(unit):
-		_status_label.text = "该单位不能包扎：需要存活战士且本地图尚未使用"
+	var skill_id := _selected_grid_skill
+	if not _grid_skill_available(skill_id) or unit == null or not _can_source_grid_skill(unit, skill_id):
+		_status_label.text = "该单位不能使用%s：职业不符或本地图已使用" % _grid_skill_name(skill_id)
 		return
 	_bandage_targeting = false
+	_selected_grid_skill = &""
 	_refresh_formation_panel()
 	_play_turn(TurnIntentType.new(
 		&"player",
 		TurnIntentType.ActionType.USE_SKILL,
 		Vector2i.ZERO,
-		SKILL_BANDAGE,
+		skill_id,
 		unit.unit_id
 	))
 
 
 func _can_source_bandage(unit) -> bool:
-	return (
-		unit != null
-		and unit.is_alive()
-		and unit.unit_class == SquadUnitStateType.CLASS_WARRIOR
-	)
+	return _can_source_grid_skill(unit, SKILL_BANDAGE)
+
+
+func _can_source_grid_skill(unit, skill_id: StringName) -> bool:
+	if unit == null or not unit.is_alive() or unit.has_used_grid_skill(skill_id):
+		return false
+	return unit.unit_class == _grid_skill_class(skill_id)
 
 
 func _bandage_available() -> bool:
+	return _grid_skill_available(SKILL_BANDAGE)
+
+
+func _grid_skill_available(skill_id: StringName) -> bool:
 	if not _actors.has(&"player"):
 		return false
-	if _actors[&"player"].map_passive_state.get(&"bandage_used", false):
-		return false
+	if skill_id == SKILL_TRAP:
+		for trap: Dictionary in _map_effects.get("traps", []):
+			if trap.get("cell", Vector2i(-1, -1)) == _actors[&"player"].cell:
+				return false
 	for unit in _actors[&"player"].units:
-		if _can_source_bandage(unit):
+		if _can_source_grid_skill(unit, skill_id):
 			return true
 	return false
 
 
 func _refresh_bandage_button() -> void:
-	if _bandage_button == null:
-		return
-	var already_used: bool = (
-		_actors.has(&"player")
-		and _actors[&"player"].map_passive_state.get(&"bandage_used", false)
-	)
-	if _bandage_targeting:
-		_bandage_button.text = "取消包扎选择"
-	elif already_used:
-		_bandage_button.text = "包扎｜本地图已使用"
-	else:
-		_bandage_button.text = "包扎｜本地图 1 次"
-	_bandage_button.disabled = _busy or (not _bandage_targeting and not _bandage_available())
+	_refresh_grid_skill_buttons()
+
+
+func _refresh_grid_skill_buttons() -> void:
+	for skill_id: StringName in _grid_skill_buttons:
+		var button: Button = _grid_skill_buttons[skill_id]
+		var available_count := 0
+		if _actors.has(&"player"):
+			for unit in _actors[&"player"].units:
+				if _can_source_grid_skill(unit, skill_id):
+					available_count += 1
+		button.text = (
+			"取消%s" % _grid_skill_name(skill_id)
+			if _selected_grid_skill == skill_id
+			else "%s ×%d" % [_grid_skill_name(skill_id), available_count]
+		)
+		button.disabled = _busy or (
+			_selected_grid_skill != skill_id and not _grid_skill_available(skill_id)
+		)
+
+
+func _grid_skill_class(skill_id: StringName) -> StringName:
+	match skill_id:
+		SKILL_BANDAGE: return SquadUnitStateType.CLASS_WARRIOR
+		SKILL_FIRST_STRIKE: return SquadUnitStateType.CLASS_ARCHER
+		SKILL_TRAP: return SquadUnitStateType.CLASS_ASSASSIN
+		SKILL_GUARD: return SquadUnitStateType.CLASS_TANK
+	return &""
+
+
+func _class_grid_skill(unit_class: StringName) -> StringName:
+	match unit_class:
+		SquadUnitStateType.CLASS_WARRIOR: return SKILL_BANDAGE
+		SquadUnitStateType.CLASS_ARCHER: return SKILL_FIRST_STRIKE
+		SquadUnitStateType.CLASS_ASSASSIN: return SKILL_TRAP
+		SquadUnitStateType.CLASS_TANK: return SKILL_GUARD
+	return &""
+
+
+func _grid_skill_name(skill_id: StringName) -> String:
+	match skill_id:
+		SKILL_BANDAGE: return "包扎"
+		SKILL_FIRST_STRIKE: return "先发"
+		SKILL_TRAP: return "陷阱"
+		SKILL_GUARD: return "戒备"
+	return "技能"
 
 
 func _make_label(
@@ -1015,6 +1123,8 @@ func _format_turn_log(turn_index: int, intents: Dictionary, resolution) -> Strin
 					]
 					if engagement.get("first_class_advantage", 0) > 0:
 						advantage_text += "（含越战越勇1）"
+					if engagement.get("first_guard_advantage", 0) > 0:
+						advantage_text += "（戒备补%d）" % engagement["first_guard_advantage"]
 				elif encounter.get("second_advantage", 0) > 0:
 					advantage_text = "%s优势%d" % [
 						_actor_name(encounter["second_squad_id"]),
@@ -1022,6 +1132,8 @@ func _format_turn_log(turn_index: int, intents: Dictionary, resolution) -> Strin
 					]
 					if engagement.get("second_class_advantage", 0) > 0:
 						advantage_text += "（含越战越勇1）"
+					if engagement.get("second_guard_advantage", 0) > 0:
+						advantage_text += "（戒备补%d）" % engagement["second_guard_advantage"]
 				lines.append("  接敌：%s%d vs %s%d → %s" % [
 					_contact_side_text(first_contact.get("side", &"front")),
 					first_contact.get("score", 2),
@@ -1032,12 +1144,22 @@ func _format_turn_log(turn_index: int, intents: Dictionary, resolution) -> Strin
 			if group["combat_events"].is_empty():
 				lines.append("  同阵营：跳过战斗")
 			for event: Dictionary in group["combat_events"]:
-				var action_text := "连击" if event.get("action_kind", &"normal_attack") == &"combo_attack" else "普攻"
+				var action_text := "普攻"
+				match event.get("action_kind", &"normal_attack"):
+					&"combo_attack": action_text = "连击"
+					&"volley_primary": action_text = "齐射·主目标"
+					&"volley_secondary": action_text = "齐射·溅射"
+					&"bullying_attack": action_text = "欺凌"
+				if event.get("activated_skill_id", &"") == &"protect":
+					action_text = "保护＋" + action_text
+				if event.get("protection_triggered", false):
+					action_text += "（保护承伤）"
 				if event.get("damage_bonus", 0) > 0:
 					action_text += "+浴血"
 				var resource_text := ""
 				if event.get("resource_id", &"") != &"":
-					resource_text = " TP%d→%d" % [
+					resource_text = " %s%d→%d" % [
+						String(event.get("resource_id", &"")).to_upper(),
 						event.get("resource_before", 0), event.get("resource_after", 0)
 					]
 				lines.append(
@@ -1066,16 +1188,27 @@ func _format_turn_log(turn_index: int, intents: Dictionary, resolution) -> Strin
 	for event: Dictionary in resolution.enemy_events:
 		if event.get("kind", &"") == &"bandit_alerted":
 			lines.append("强盗发现主角：进入永久追击，下回合开始移动")
+	for event: Dictionary in resolution.trap_events:
+		lines.append("陷阱触发：%s/%s 受到 %d 伤害" % [
+			_actor_name(event.get("actor_id", &"")),
+			String(event.get("target_unit_id", &"")), event.get("amount", 0)
+		])
 	for event: Dictionary in resolution.grid_skill_events:
-		if event.get("skill_id", &"") != SKILL_BANDAGE:
-			continue
 		if event.get("status", &"") == &"source_dead":
-			lines.append("包扎：本地图次数已使用，施术战士阵亡，治疗未生效")
-		else:
+			lines.append("%s：次数已使用，但来源单位阵亡，效果失败" % _grid_skill_name(event.get("skill_id", &"")))
+		elif event.get("skill_id", &"") == SKILL_BANDAGE:
 			var total_heal := 0
 			for heal: Dictionary in event.get("heals", []):
 				total_heal += heal.get("amount", 0)
 			lines.append("包扎：本地图次数已使用，小队共恢复 %d HP" % total_heal)
+		elif event.get("skill_id", &"") == SKILL_FIRST_STRIKE:
+			lines.append("先发制人：%s" % (
+				"未发现目标" if event.get("target_actor_id", &"") == &"" else "命中%s" % _actor_name(event["target_actor_id"])
+			))
+		elif event.get("skill_id", &"") == SKILL_TRAP:
+			lines.append("陷阱：已在当前格放置")
+		elif event.get("skill_id", &"") == SKILL_GUARD:
+			lines.append("戒备：已生效，将保留至一次劣势接敌")
 	for actor_id: StringName in intents:
 		var intent = intents[actor_id]
 		var outcome: Dictionary = resolution.outcome_for(actor_id)
@@ -1118,7 +1251,7 @@ func _intent_text(intent) -> String:
 	if intent.action_type == TurnIntentType.ActionType.WAIT:
 		return "等待"
 	if intent.action_type == TurnIntentType.ActionType.USE_SKILL:
-		return "使用包扎" if intent.skill_id == SKILL_BANDAGE else "使用技能"
+		return "使用%s" % _grid_skill_name(intent.skill_id)
 	match intent.delta:
 		Vector2i.UP:
 			return "向上"
@@ -1139,7 +1272,7 @@ func _reason_text(reason: StringName) -> String:
 			return "主动等待"
 		&"used_grid_skill":
 			return "技能已结算"
-		&"unknown_grid_skill", &"invalid_skill_source", &"grid_skill_already_used":
+		&"unknown_grid_skill", &"invalid_skill_source", &"grid_skill_already_used", &"trap_already_present":
 			return "技能使用失败"
 		&"blocked_by_terrain":
 			return "地形阻挡"
@@ -1194,6 +1327,14 @@ func _draw() -> void:
 			var floor_color := COLOR_FLOOR_A if (x + y) % 2 == 0 else COLOR_FLOOR_B
 			draw_rect(cell_rect, COLOR_WALL if _blocked.has(cell) else floor_color)
 			draw_rect(cell_rect, COLOR_GRID, false, 1.0)
+	var debug_enabled := _ai_debug_toggle != null and _ai_debug_toggle.button_pressed
+	for trap: Dictionary in _map_effects.get("traps", []):
+		if trap.get("faction", &"") != &"player" and not debug_enabled:
+			continue
+		var center := _cell_to_world(trap.get("cell", Vector2i.ZERO))
+		draw_circle(center, 9.0, Color("a76be8"))
+		draw_line(center + Vector2(-7, -7), center + Vector2(7, 7), Color.WHITE, 2.0)
+		draw_line(center + Vector2(7, -7), center + Vector2(-7, 7), Color.WHITE, 2.0)
 	if _ai_debug_toggle == null or not _ai_debug_toggle.button_pressed:
 		return
 	match _scenario_id:

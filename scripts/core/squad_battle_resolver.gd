@@ -3,8 +3,14 @@ extends RefCounted
 const SquadUnitStateType = preload("res://scripts/model/squad_unit_state.gd")
 
 const SKILL_COMBO := &"combo"
+const SKILL_VOLLEY := &"volley"
+const SKILL_PROTECT := &"protect"
+const SKILL_BULLY := &"bullying"
 const PASSIVE_BLOODIED := &"bloodied"
 const COMBO_TP_COST := 4
+const VOLLEY_MP_COST := 3
+const PROTECT_TP_COST := 2
+const BULLY_MP_COST := 2
 
 
 static func resolve_round(
@@ -32,13 +38,17 @@ static func resolve_round(
 		"second_alive_before": second_squad.living_unit_count(),
 		"formations_before": formation_snapshot(first_squad, second_squad),
 	}
+	var protection_queues: Dictionary = {
+		first_squad.actor_id: [],
+		second_squad.actor_id: [],
+	}
 
 	var round_zero_turns := _build_round_zero_order(
 		first_squad, second_squad, first_advantage, second_advantage, rng
 	)
 	if not round_zero_turns.is_empty():
 		result["round_zero_selected"] = _selected_unit_ids(round_zero_turns)
-		_resolve_turns(result, round_zero_turns, &"round_zero", first_squad, second_squad, rng)
+		_resolve_turns(result, round_zero_turns, &"round_zero", first_squad, second_squad, rng, protection_queues)
 
 	if first_squad.is_alive() and second_squad.is_alive():
 		_resolve_turns(
@@ -47,7 +57,8 @@ static func resolve_round(
 			&"round_one",
 			first_squad,
 			second_squad,
-			rng
+			rng,
+			protection_queues
 		)
 	else:
 		result["round_one_cancelled"] = true
@@ -68,7 +79,8 @@ static func _resolve_turns(
 	phase: StringName,
 	first_squad,
 	second_squad,
-	rng: RandomNumberGenerator
+	rng: RandomNumberGenerator,
+	protection_queues: Dictionary
 ) -> void:
 	var schedule_start: int = result["turn_schedule"].size()
 	var event_start: int = result["events"].size()
@@ -84,6 +96,91 @@ static func _resolve_turns(
 			_append_skipped_action(result, turn, phase, phase_index, &"normal_attack", &"", &"no_living_enemy")
 			continue
 
+		var activation: Dictionary = {}
+		if (
+			attacker.unit_class == SquadUnitStateType.CLASS_TANK
+			and attacker.can_spend_resource(SquadUnitStateType.RESOURCE_TP, PROTECT_TP_COST)
+			and acting_squad.living_unit_count() > 1
+			and not _queue_contains(protection_queues[acting_squad.actor_id], attacker.unit_id)
+		):
+			var protect_tp_before: int = attacker.resource_value(SquadUnitStateType.RESOURCE_TP)
+			attacker.spend_resource(SquadUnitStateType.RESOURCE_TP, PROTECT_TP_COST)
+			protection_queues[acting_squad.actor_id].append(attacker.unit_id)
+			activation = {
+				"activated_skill_id": SKILL_PROTECT,
+				"resource_id": SquadUnitStateType.RESOURCE_TP,
+				"resource_before": protect_tp_before,
+				"resource_spent": PROTECT_TP_COST,
+			}
+
+		if (
+			attacker.unit_class == SquadUnitStateType.CLASS_ASSASSIN
+			and defending_squad.living_unit_count() > 1
+			and attacker.can_spend_resource(SquadUnitStateType.RESOURCE_MP, BULLY_MP_COST)
+		):
+			var bully_target_info := _lowest_health_target_info(attacker, defending_squad, rng)
+			var bully_mp_before: int = attacker.resource_value(SquadUnitStateType.RESOURCE_MP)
+			attacker.spend_resource(SquadUnitStateType.RESOURCE_MP, BULLY_MP_COST)
+			_resolve_attack(
+				result, turn, phase, phase_index, &"bullying_attack", SKILL_BULLY,
+				acting_squad, defending_squad, attacker, first_squad, second_squad, rng,
+				{}, -1, 0, {
+					"target_info": bully_target_info,
+					"resource_id": SquadUnitStateType.RESOURCE_MP,
+					"resource_before": bully_mp_before,
+					"resource_spent": BULLY_MP_COST,
+					"protection_queues": protection_queues,
+				}
+			)
+			continue
+
+		if attacker.unit_class == SquadUnitStateType.CLASS_ARCHER:
+			var primary_info := _choose_target(attacker, defending_squad, rng)
+			var primary = primary_info["target"]
+			var other_targets: Array = []
+			if primary != null:
+				for candidate in defending_squad.living_units_in_row(primary.slot.y):
+					if candidate.unit_id != primary.unit_id:
+						other_targets.append(candidate)
+			other_targets.sort_custom(func(first, second):
+				if first.slot.x != second.slot.x:
+					return first.slot.x < second.slot.x
+				return String(first.unit_id) < String(second.unit_id)
+			)
+			if (
+				primary != null and not other_targets.is_empty()
+				and attacker.can_spend_resource(SquadUnitStateType.RESOURCE_MP, VOLLEY_MP_COST)
+			):
+				var volley_mp_before: int = attacker.resource_value(SquadUnitStateType.RESOURCE_MP)
+				attacker.spend_resource(SquadUnitStateType.RESOURCE_MP, VOLLEY_MP_COST)
+				var volley_options := {
+					"target_info": primary_info,
+					"resource_id": SquadUnitStateType.RESOURCE_MP,
+					"resource_before": volley_mp_before,
+					"resource_spent": VOLLEY_MP_COST,
+					"protection_queues": protection_queues,
+					"volley_role": &"primary",
+				}
+				_resolve_attack(
+					result, turn, phase, phase_index, &"volley_primary", SKILL_VOLLEY,
+					acting_squad, defending_squad, attacker, first_squad, second_squad, rng,
+					{}, -1, 0, volley_options
+				)
+				for target in other_targets:
+					if not target.is_alive():
+						continue
+					_resolve_attack(
+						result, turn, phase, phase_index, &"volley_secondary", SKILL_VOLLEY,
+						acting_squad, defending_squad, attacker, first_squad, second_squad, rng,
+						{}, -1, 0, {
+							"target_info": _explicit_target_info(attacker, target),
+							"resource_id": SquadUnitStateType.RESOURCE_MP,
+							"protection_queues": protection_queues,
+							"volley_role": &"secondary",
+						}
+					)
+				continue
+
 		if (
 			attacker.unit_class == SquadUnitStateType.CLASS_WARRIOR
 			and attacker.can_spend_resource(SquadUnitStateType.RESOURCE_TP, COMBO_TP_COST)
@@ -94,7 +191,8 @@ static func _resolve_turns(
 			_resolve_attack(
 				result, turn, phase, phase_index, &"combo_attack", SKILL_COMBO,
 				acting_squad, defending_squad, attacker, first_squad, second_squad, rng,
-				combo_formations_before, combo_tp_before, COMBO_TP_COST
+				combo_formations_before, combo_tp_before, COMBO_TP_COST,
+				{"protection_queues": protection_queues}
 			)
 
 		if not defending_squad.is_alive():
@@ -103,6 +201,7 @@ static func _resolve_turns(
 		_resolve_attack(
 			result, turn, phase, phase_index, &"normal_attack", &"",
 			acting_squad, defending_squad, attacker, first_squad, second_squad, rng
+			, {}, -1, 0, activation.merged({"protection_queues": protection_queues}, true)
 		)
 	result["combat_phases"].append({
 		"phase": phase,
@@ -128,18 +227,27 @@ static func _resolve_attack(
 	rng: RandomNumberGenerator,
 	formations_before_override: Dictionary = {},
 	resource_before_override: int = -1,
-	resource_spent: int = 0
+	resource_spent: int = 0,
+	options: Dictionary = {}
 ) -> void:
 	var schedule_entry := _schedule_entry(turn, phase, phase_index, action_kind, skill_id)
 	var schedule_index: int = result["turn_schedule"].size()
 	schedule_entry["schedule_index"] = schedule_index
-	var target_info := _choose_target(attacker, defending_squad, rng)
-	var target = target_info["target"]
+	var target_info: Dictionary = options.get("target_info", _choose_target(attacker, defending_squad, rng))
+	var intended_target = target_info["target"]
+	var target = intended_target
 	if target == null:
 		schedule_entry["status"] = &"skipped"
 		schedule_entry["skipped_reason"] = &"no_valid_target"
 		result["turn_schedule"].append(schedule_entry)
 		return
+	var protected_by: StringName = &""
+	var queues: Dictionary = options.get("protection_queues", {})
+	if not queues.is_empty():
+		var redirect = _consume_protection(defending_squad, intended_target, queues)
+		if redirect != null:
+			target = redirect
+			protected_by = redirect.unit_id
 
 	var health_before: int = target.health
 	var squad_health_before: int = defending_squad.health
@@ -148,11 +256,19 @@ static func _resolve_attack(
 		if formations_before_override.is_empty()
 		else formations_before_override
 	)
-	var tp_before: int = (
-		attacker.resource_value(SquadUnitStateType.RESOURCE_TP)
+	var resource_id: StringName = options.get(
+		"resource_id",
+		SquadUnitStateType.RESOURCE_TP if attacker.has_resource(SquadUnitStateType.RESOURCE_TP) else &""
+	)
+	var resource_before: int = (
+		attacker.resource_value(resource_id)
 		if resource_before_override < 0
 		else resource_before_override
 	)
+	if options.has("resource_before"):
+		resource_before = options["resource_before"]
+	if options.has("resource_spent"):
+		resource_spent = options["resource_spent"]
 	var damage_bonus := 0
 	var passive_ids: Array = []
 	if (
@@ -177,6 +293,9 @@ static func _resolve_attack(
 		"defender_squad_id": defending_squad.actor_id,
 		"attacker_unit_id": attacker.unit_id,
 		"defender_unit_id": target.unit_id,
+		"intended_defender_unit_id": intended_target.unit_id,
+		"protected_by_unit_id": protected_by,
+		"protection_triggered": protected_by != &"",
 		"attacker_class": attacker.unit_class,
 		"defender_class": target.unit_class,
 		"attacker_slot": attacker.slot,
@@ -190,11 +309,13 @@ static func _resolve_attack(
 		"defender_squad_health_before": squad_health_before,
 		"defender_squad_health_after": defending_squad.health,
 		"target_died": not target.is_alive(),
-		"resource_id": SquadUnitStateType.RESOURCE_TP if attacker.has_resource(SquadUnitStateType.RESOURCE_TP) else &"",
-		"resource_before": tp_before,
+		"resource_id": resource_id,
+		"resource_before": resource_before,
 		"resource_spent": resource_spent,
 		"resource_gained": tp_gained,
-		"resource_after": attacker.resource_value(SquadUnitStateType.RESOURCE_TP),
+		"resource_after": attacker.resource_value(resource_id),
+		"activated_skill_id": options.get("activated_skill_id", &""),
+		"volley_role": options.get("volley_role", &""),
 		"preferred_row": attacker.preferred_row(),
 		"selected_row": target_info["selected_row"],
 		"used_fallback_row": target_info["used_fallback_row"],
@@ -312,6 +433,7 @@ static func _unit_snapshot(squad) -> Array:
 			"attack": unit.attack,
 			"speed": unit.speed,
 			"resources": unit.resources.duplicate(true),
+			"map_skill_state": unit.map_skill_state.duplicate(true),
 			"alive": unit.is_alive(),
 		})
 	return snapshot
@@ -385,3 +507,65 @@ static func _choose_target(attacker, defending_squad, rng: RandomNumberGenerator
 		"target_rule": StringName("%s_%s" % [row_rule, column_rule]),
 		"target_distance": target_distance,
 	}
+
+
+static func _explicit_target_info(attacker, target) -> Dictionary:
+	return {
+		"target": target,
+		"selected_row": target.slot.y,
+		"used_fallback_row": target.slot.y != attacker.preferred_row(),
+		"used_random_tie": false,
+		"candidate_unit_ids": [target.unit_id],
+		"target_rule": &"volley_same_row",
+		"target_distance": absi(target.slot.x - attacker.slot.x),
+	}
+
+
+static func _lowest_health_target_info(
+	attacker, defending_squad, rng: RandomNumberGenerator
+) -> Dictionary:
+	var lowest_health := 1000000
+	var candidates: Array = []
+	for target in defending_squad.living_units():
+		if target.health < lowest_health:
+			lowest_health = target.health
+			candidates = [target]
+		elif target.health == lowest_health:
+			candidates.append(target)
+	candidates.sort_custom(func(first, second): return String(first.unit_id) < String(second.unit_id))
+	var target = (
+		candidates[0]
+		if candidates.size() == 1
+		else candidates[rng.randi_range(0, candidates.size() - 1)]
+	)
+	return {
+		"target": target,
+		"selected_row": target.slot.y,
+		"used_fallback_row": target.slot.y != attacker.preferred_row(),
+		"used_random_tie": candidates.size() > 1,
+		"candidate_unit_ids": candidates.map(func(candidate): return candidate.unit_id),
+		"target_rule": &"lowest_current_health",
+		"target_distance": absi(target.slot.x - attacker.slot.x),
+	}
+
+
+static func _queue_contains(queue: Array, unit_id: StringName) -> bool:
+	return unit_id in queue
+
+
+static func _consume_protection(defending_squad, intended_target, queues: Dictionary):
+	var queue: Array = queues.get(defending_squad.actor_id, [])
+	var index := 0
+	while index < queue.size():
+		var protector = defending_squad.unit_by_id(queue[index])
+		if protector == null or not protector.is_alive():
+			queue.remove_at(index)
+			continue
+		if protector.unit_id == intended_target.unit_id:
+			index += 1
+			continue
+		queue.remove_at(index)
+		queues[defending_squad.actor_id] = queue
+		return protector
+	queues[defending_squad.actor_id] = queue
+	return null

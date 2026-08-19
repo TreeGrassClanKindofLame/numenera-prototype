@@ -23,6 +23,7 @@ var max_health: int
 var attack: int
 var speed: int
 var resources: Dictionary
+var map_skill_state: Dictionary
 
 
 func _init(
@@ -33,7 +34,8 @@ func _init(
 	p_max_health: int = 5,
 	p_attack: int = 2,
 	p_speed: int = 2,
-	p_resources: Dictionary = {}
+	p_resources: Dictionary = {},
+	p_map_skill_state: Dictionary = {}
 ) -> void:
 	unit_id = p_unit_id
 	unit_class = p_unit_class
@@ -47,6 +49,7 @@ func _init(
 		if p_resources.is_empty()
 		else p_resources.duplicate(true)
 	)
+	map_skill_state = p_map_skill_state.duplicate(true)
 
 
 static func create_for_class(
@@ -102,8 +105,35 @@ func clone():
 		max_health,
 		attack,
 		speed,
-		resources
+		resources,
+		map_skill_state
 	)
+
+
+func has_used_grid_skill(skill_id: StringName) -> bool:
+	return map_skill_state.get("used_%s" % String(skill_id), false)
+
+
+func mark_grid_skill_used(skill_id: StringName) -> void:
+	map_skill_state["used_%s" % String(skill_id)] = true
+
+
+func is_guard_armed() -> bool:
+	return map_skill_state.get("guard_armed", false)
+
+
+func guard_order() -> int:
+	return map_skill_state.get("guard_order", -1)
+
+
+func arm_guard(order: int) -> void:
+	map_skill_state["guard_armed"] = true
+	map_skill_state["guard_order"] = order
+
+
+func consume_guard() -> void:
+	map_skill_state["guard_armed"] = false
+	map_skill_state["guard_order"] = -1
 
 
 func has_resource(resource_id: StringName) -> bool:

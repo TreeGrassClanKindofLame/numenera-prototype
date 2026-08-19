@@ -6,8 +6,12 @@ const SquadBattleResolverType = preload("res://scripts/core/squad_battle_resolve
 const SquadUnitStateType = preload("res://scripts/model/squad_unit_state.gd")
 
 const SKILL_BANDAGE := &"bandage"
+const SKILL_FIRST_STRIKE := &"first_strike"
+const SKILL_TRAP := &"trap"
+const SKILL_GUARD := &"guard"
 const BANDAGE_HEAL := 2
-const PASSIVE_BANDAGE_USED := &"bandage_used"
+const FIRST_STRIKE_DAMAGE := 1
+const TRAP_DAMAGE := 2
 const PASSIVE_BATTLE_HARDENED_COUNT := &"battle_hardened_count"
 const PASSIVE_BATTLE_HARDENED_USED := &"battle_hardened_used"
 
@@ -24,7 +28,8 @@ static func resolve(
 	blocked: Dictionary,
 	actor_states: Array,
 	intents: Dictionary,
-	battle_seed: int = 1337
+	battle_seed: int = 1337,
+	map_effects: Dictionary = {}
 ):
 	var battle_rng := RandomNumberGenerator.new()
 	battle_rng.seed = battle_seed
@@ -36,6 +41,9 @@ static func resolve(
 	var valid_movers: Dictionary = {}
 	var actor_reasons: Dictionary = {}
 	var pending_grid_skills: Array = []
+	var effects: Dictionary = map_effects.duplicate(true)
+	if not effects.has("traps"):
+		effects["traps"] = []
 
 	for source_actor in actor_states:
 		var actor = source_actor.clone()
@@ -66,7 +74,7 @@ static func resolve(
 		if intent.action_type == TurnIntentType.ActionType.WAIT:
 			actor_reasons[actor_id] = &"waited"
 		elif intent.action_type == TurnIntentType.ActionType.USE_SKILL:
-			var skill_event := _prepare_grid_skill(states[actor_id], intent)
+			var skill_event := _prepare_grid_skill(states[actor_id], intent, effects)
 			if skill_event.get("valid", false):
 				movement_result["reason"] = &"used_grid_skill"
 				actor_reasons[actor_id] = &"used_grid_skill"
@@ -108,6 +116,10 @@ static func resolve(
 
 	var next_wave_index := 0
 	var dead_actor_ids: Array = []
+	_resolve_traps(
+		actor_ids, states, current_positions, last_sources, result.movement_results,
+		dead_actor_ids, actor_reasons, effects, result, battle_rng
+	)
 
 	# Special wave zero: reciprocal initial moves collide on the crossed edge.
 	var edge_specs := _build_head_on_specs(
@@ -174,14 +186,21 @@ static func resolve(
 		next_wave_index += 1
 		grid_wave_count += 1
 
-	_resolve_grid_skills(pending_grid_skills, states, dead_actor_ids, result)
+	_resolve_grid_skills(
+		pending_grid_skills, states, current_positions, dead_actor_ids, actor_reasons, result,
+		blocked, board_size, effects, battle_rng
+	)
+	result.final_map_effects = effects.duplicate(true)
 
 	# Commit final living states and summarize each actor's complete turn.
 	result.final_positions.clear()
 	for actor_id: StringName in actor_ids:
 		if actor_id in dead_actor_ids:
 			var dead_target: Vector2i = result.movement_positions[actor_id]
-			result.set_outcome(actor_id, false, false, &"died_in_combat", dead_target)
+			result.set_outcome(
+				actor_id, false, false,
+				actor_reasons.get(actor_id, &"died_to_grid_skill"), dead_target
+			)
 			continue
 
 		var actor = states[actor_id]
@@ -277,6 +296,8 @@ static func _resolve_collision_wave(
 			engagement["second_class_advantage"] = second_class_advantage
 			engagement["first_advantage"] += first_class_advantage
 			engagement["second_advantage"] += second_class_advantage
+			var guard_result := _apply_guard_advantage(first, second, engagement)
+			engagement.merge(guard_result, true)
 			var encounter: Dictionary = SquadBattleResolverType.resolve_round(
 				first,
 				second,
@@ -369,6 +390,116 @@ static func _resolve_collision_wave(
 	wave["positions_after"] = current_positions.duplicate(true)
 	wave["health_after"] = _health_snapshot(current_positions, states)
 	return wave
+
+
+static func _resolve_traps(
+	actor_ids: Array,
+	states: Dictionary,
+	current_positions: Dictionary,
+	last_sources: Dictionary,
+	movement_results: Dictionary,
+	dead_actor_ids: Array,
+	actor_reasons: Dictionary,
+	map_effects: Dictionary,
+	result,
+	battle_rng: RandomNumberGenerator
+) -> void:
+	var traps: Array = map_effects.get("traps", [])
+	for actor_id: StringName in actor_ids:
+		if not current_positions.has(actor_id):
+			continue
+		if not movement_results[actor_id].get("moved", false):
+			continue
+		var trap_index := -1
+		for index in traps.size():
+			var trap: Dictionary = traps[index]
+			if (
+				trap.get("cell", Vector2i(-1, -1)) == current_positions[actor_id]
+				and trap.get("faction", &"") != states[actor_id].faction
+			):
+				trap_index = index
+				break
+		if trap_index < 0:
+			continue
+		var triggered_trap: Dictionary = traps[trap_index]
+		traps.remove_at(trap_index)
+		var squad = states[actor_id]
+		var candidates: Array = []
+		var lowest_health := 1000000
+		for unit in squad.units:
+			if not unit.is_alive():
+				continue
+			if unit.health < lowest_health:
+				lowest_health = unit.health
+				candidates = [unit]
+			elif unit.health == lowest_health:
+				candidates.append(unit)
+		var target = candidates[battle_rng.randi_range(0, candidates.size() - 1)]
+		var health_before: int = target.health
+		target.health -= TRAP_DAMAGE
+		squad.sync_summary_stats()
+		result.trap_events.append({
+			"actor_id": actor_id,
+			"target_unit_id": target.unit_id,
+			"health_before": health_before,
+			"health_after": target.health,
+			"amount": TRAP_DAMAGE,
+			"cell": current_positions[actor_id],
+			"trap": triggered_trap,
+		})
+		if not squad.is_alive():
+			dead_actor_ids.append(actor_id)
+			actor_reasons[actor_id] = &"died_to_trap"
+			current_positions.erase(actor_id)
+			last_sources.erase(actor_id)
+	map_effects["traps"] = traps
+
+
+static func _trap_index_at(map_effects: Dictionary, cell: Vector2i) -> int:
+	var traps: Array = map_effects.get("traps", [])
+	for index in traps.size():
+		if traps[index].get("cell", Vector2i(-1, -1)) == cell:
+			return index
+	return -1
+
+
+static func _apply_guard_advantage(first, second, engagement: Dictionary) -> Dictionary:
+	var first_before: int = engagement["first_advantage"]
+	var second_before: int = engagement["second_advantage"]
+	var first_bonus := 0
+	var second_bonus := 0
+	var first_source: StringName = &""
+	var second_source: StringName = &""
+	if first_before < second_before:
+		var guard = _oldest_armed_guard(first)
+		if guard != null:
+			first_bonus = second_before - first_before
+			first_source = guard.unit_id
+			guard.consume_guard()
+	elif second_before < first_before:
+		var guard = _oldest_armed_guard(second)
+		if guard != null:
+			second_bonus = first_before - second_before
+			second_source = guard.unit_id
+			guard.consume_guard()
+	engagement["first_advantage"] += first_bonus
+	engagement["second_advantage"] += second_bonus
+	return {
+		"first_guard_advantage": first_bonus,
+		"second_guard_advantage": second_bonus,
+		"first_guard_unit_id": first_source,
+		"second_guard_unit_id": second_source,
+	}
+
+
+static func _oldest_armed_guard(squad):
+	var selected = null
+	for unit in squad.units:
+		if not unit.is_alive() or not unit.is_guard_armed():
+			continue
+		if selected == null or unit.guard_order() < selected.guard_order():
+			selected = unit
+	return selected
 
 
 static func _build_head_on_specs(
@@ -512,7 +643,7 @@ static func _build_engagement(
 	}
 
 
-static func _prepare_grid_skill(actor, intent) -> Dictionary:
+static func _prepare_grid_skill(actor, intent, map_effects: Dictionary) -> Dictionary:
 	var event := {
 		"valid": false,
 		"actor_id": actor.actor_id,
@@ -520,18 +651,35 @@ static func _prepare_grid_skill(actor, intent) -> Dictionary:
 		"skill_id": intent.skill_id,
 		"status": &"invalid",
 		"heals": [],
+		"damages": [],
 	}
-	if intent.skill_id != SKILL_BANDAGE:
-		event["reason"] = &"unknown_grid_skill"
-		return event
-	if actor.map_passive_state.get(PASSIVE_BANDAGE_USED, false):
-		event["reason"] = &"grid_skill_already_used"
-		return event
+	var required_class: StringName
+	match intent.skill_id:
+		SKILL_BANDAGE:
+			required_class = SquadUnitStateType.CLASS_WARRIOR
+		SKILL_FIRST_STRIKE:
+			required_class = SquadUnitStateType.CLASS_ARCHER
+		SKILL_TRAP:
+			required_class = SquadUnitStateType.CLASS_ASSASSIN
+		SKILL_GUARD:
+			required_class = SquadUnitStateType.CLASS_TANK
+		_:
+			event["reason"] = &"unknown_grid_skill"
+			return event
 	var source = actor.unit_by_id(intent.source_unit_id)
-	if source == null or not source.is_alive() or source.unit_class != SquadUnitStateType.CLASS_WARRIOR:
+	if source == null or not source.is_alive() or source.unit_class != required_class:
 		event["reason"] = &"invalid_skill_source"
 		return event
-	actor.map_passive_state[PASSIVE_BANDAGE_USED] = true
+	if source.has_used_grid_skill(intent.skill_id):
+		event["reason"] = &"grid_skill_already_used"
+		return event
+	if intent.skill_id == SKILL_TRAP and _trap_index_at(map_effects, actor.cell) >= 0:
+		event["reason"] = &"trap_already_present"
+		return event
+	if intent.skill_id not in [SKILL_BANDAGE, SKILL_FIRST_STRIKE, SKILL_TRAP, SKILL_GUARD]:
+		event["reason"] = &"unknown_grid_skill"
+		return event
+	source.mark_grid_skill_used(intent.skill_id)
 	event["valid"] = true
 	event["status"] = &"pending"
 	return event
@@ -540,9 +688,18 @@ static func _prepare_grid_skill(actor, intent) -> Dictionary:
 static func _resolve_grid_skills(
 	pending_grid_skills: Array,
 	states: Dictionary,
+	current_positions: Dictionary,
 	dead_actor_ids: Array,
-	result
+	actor_reasons: Dictionary,
+	result,
+	blocked: Dictionary,
+	board_size: Vector2i,
+	map_effects: Dictionary,
+	battle_rng: RandomNumberGenerator
 ) -> void:
+	var health_deltas: Dictionary = {}
+	var resolved_events: Array = []
+	var next_guard_order := _next_guard_order(states)
 	for pending: Dictionary in pending_grid_skills:
 		var event := pending.duplicate(true)
 		var actor_id: StringName = event["actor_id"]
@@ -550,24 +707,116 @@ static func _resolve_grid_skills(
 		var source = actor.unit_by_id(event["source_unit_id"]) if actor != null else null
 		if actor == null or actor_id in dead_actor_ids or source == null or not source.is_alive():
 			event["status"] = &"source_dead"
-			result.grid_skill_events.append(event)
+			resolved_events.append(event)
 			continue
-		var heals: Array = []
-		for unit in actor.units:
-			if not unit.is_alive():
-				continue
-			var health_before: int = unit.health
-			unit.health = mini(unit.health + BANDAGE_HEAL, unit.max_health)
-			heals.append({
-				"unit_id": unit.unit_id,
-				"health_before": health_before,
-				"health_after": unit.health,
-				"amount": unit.health - health_before,
-			})
-		actor.sync_summary_stats()
 		event["status"] = &"resolved"
-		event["heals"] = heals
+		match event["skill_id"]:
+			SKILL_BANDAGE:
+				for unit in actor.units:
+					if unit.is_alive():
+						var heal_amount := mini(BANDAGE_HEAL, unit.max_health - unit.health)
+						_add_health_delta(health_deltas, actor_id, unit.unit_id, heal_amount)
+						event["heals"].append({
+							"unit_id": unit.unit_id,
+							"health_before": unit.health,
+							"amount": heal_amount,
+						})
+			SKILL_FIRST_STRIKE:
+				var target_id := _first_hostile_in_ray(
+					actor, current_positions, states, blocked, board_size
+				)
+				event["target_actor_id"] = target_id
+				if target_id != &"":
+					for unit in states[target_id].units:
+						if unit.is_alive():
+							_add_health_delta(health_deltas, target_id, unit.unit_id, -FIRST_STRIKE_DAMAGE)
+							event["damages"].append({
+								"unit_id": unit.unit_id,
+								"health_before": unit.health,
+								"amount": FIRST_STRIKE_DAMAGE,
+							})
+			SKILL_TRAP:
+				var trap := {
+					"cell": current_positions[actor_id],
+					"faction": actor.faction,
+					"source_actor_id": actor_id,
+					"source_unit_id": source.unit_id,
+				}
+				if _trap_index_at(map_effects, trap["cell"]) < 0:
+					map_effects["traps"].append(trap)
+					event["cell"] = trap["cell"]
+				else:
+					event["status"] = &"trap_already_present"
+			SKILL_GUARD:
+				source.arm_guard(next_guard_order)
+				event["guard_order"] = next_guard_order
+				next_guard_order += 1
+		resolved_events.append(event)
+
+	# All post-combat skills selected their targets from the same snapshot. Apply
+	# their combined health changes only after every live source has resolved.
+	for actor_id: StringName in health_deltas:
+		var actor = states.get(actor_id)
+		if actor == null:
+			continue
+		for unit_id: StringName in health_deltas[actor_id]:
+			var unit = actor.unit_by_id(unit_id)
+			if unit == null:
+				continue
+			var delta: int = health_deltas[actor_id][unit_id]
+			unit.health = mini(unit.health + delta, unit.max_health)
+		actor.sync_summary_stats()
+		if not actor.is_alive() and not actor_id in dead_actor_ids:
+			dead_actor_ids.append(actor_id)
+			actor_reasons[actor_id] = &"died_to_grid_skill"
+			current_positions.erase(actor_id)
+
+	for event: Dictionary in resolved_events:
+		var event_actor = states.get(event["actor_id"])
+		for heal: Dictionary in event["heals"]:
+			var unit = event_actor.unit_by_id(heal["unit_id"])
+			heal["health_after"] = unit.health
+		if event.has("target_actor_id") and event["target_actor_id"] != &"":
+			var target_actor = states.get(event["target_actor_id"])
+			for damage: Dictionary in event["damages"]:
+				var unit = target_actor.unit_by_id(damage["unit_id"])
+				damage["health_after"] = unit.health
 		result.grid_skill_events.append(event)
+
+
+static func _add_health_delta(
+	deltas: Dictionary, actor_id: StringName, unit_id: StringName, amount: int
+) -> void:
+	if not deltas.has(actor_id):
+		deltas[actor_id] = {}
+	deltas[actor_id][unit_id] = deltas[actor_id].get(unit_id, 0) + amount
+
+
+static func _first_hostile_in_ray(
+	actor, current_positions: Dictionary, states: Dictionary,
+	blocked: Dictionary, board_size: Vector2i
+) -> StringName:
+	for distance in range(1, 4):
+		var cell: Vector2i = current_positions[actor.actor_id] + actor.facing * distance
+		if not _is_inside(cell, board_size) or blocked.has(cell):
+			break
+		var candidates: Array = []
+		for other_id: StringName in current_positions:
+			if current_positions[other_id] == cell and states[other_id].faction != actor.faction:
+				candidates.append(other_id)
+		candidates.sort()
+		if not candidates.is_empty():
+			return candidates[0]
+	return &""
+
+
+static func _next_guard_order(states: Dictionary) -> int:
+	var order := 0
+	for actor in states.values():
+		for unit in actor.units:
+			if unit.is_guard_armed():
+				order = maxi(order, unit.guard_order() + 1)
+	return order
 
 
 static func _battle_hardened_bonus(squad) -> int:

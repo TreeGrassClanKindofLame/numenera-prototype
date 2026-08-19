@@ -23,6 +23,8 @@ func _run_all() -> void:
 	_test_class_resources_and_clone()
 	_test_tp_combo_and_bloodied_rules()
 	_test_bandage_grid_skill_rules()
+	_test_new_grid_class_skills()
+	_test_volley_and_protection_auto_skills()
 	_test_battle_hardened_third_encounter_once()
 	_test_front_and_back_row_preferences()
 	_test_empty_preferred_row_falls_back()
@@ -59,7 +61,7 @@ func _run_all() -> void:
 	await get_tree().create_timer(0.15).timeout
 
 	if _failures == 0:
-		print("PASS: %d checks across 35 squad-combat scenarios." % _checks)
+		print("PASS: %d checks across 37 squad-combat scenarios." % _checks)
 		get_tree().quit(0)
 	else:
 		push_error("FAIL: %d of %d checks failed." % [_failures, _checks])
@@ -165,7 +167,7 @@ func _test_bandage_grid_skill_rules() -> void:
 	_expect_equal(healed.unit_by_id(&"wounded").health, 6, "bandage heals each living wounded unit by two")
 	_expect_equal(healed.unit_by_id(&"dead").health, 0, "bandage does not revive dead units")
 	_expect_equal(resolution.grid_skill_events[0]["status"], &"resolved", "bandage resolves after a peaceful grid turn")
-	_expect_true(healed.map_passive_state.get(&"bandage_used", false), "bandage consumes the squad's once-per-map use immediately")
+	_expect_true(healed.unit_by_id(&"source").has_used_grid_skill(&"bandage"), "bandage consumes the source warrior's once-per-map use immediately")
 	var repeated_cast = _resolve(Vector2i(5, 4), [], [healed], {
 		&"player": _skill(&"player", &"bandage", &"source"),
 	})
@@ -177,7 +179,7 @@ func _test_bandage_grid_skill_rules() -> void:
 		&"full": _skill(&"full", &"bandage", &"full_source"),
 	})
 	_expect_equal(empty_cast.grid_skill_events[0]["heals"][0]["amount"], 0, "bandage may be spent while every living unit is at full health")
-	_expect_true(empty_cast.actor_state_for(&"full").map_passive_state.get(&"bandage_used", false), "empty bandage still consumes the map use")
+	_expect_true(empty_cast.actor_state_for(&"full").unit_by_id(&"full_source").has_used_grid_skill(&"bandage"), "empty bandage still consumes that warrior's map use")
 
 	var doomed = _unit(&"doomed", &"warrior", 1, 0, 3, 1, 1)
 	var survivor = _unit(&"survivor", &"tank", 2, 0, 8, 0, 1)
@@ -192,6 +194,145 @@ func _test_bandage_grid_skill_rules() -> void:
 	}, 74)
 	_expect_equal(lethal.grid_skill_events[0]["status"], &"source_dead", "bandage fails after its chosen warrior dies")
 	_expect_equal(lethal.actor_state_for(&"player").unit_by_id(&"survivor").health, 4, "failed bandage does not fall back to another warrior")
+
+
+func _test_new_grid_class_skills() -> void:
+	var archer = _unit(&"archer", &"archer", 1, 0, 3, 3, 2)
+	var shooter = _squad(&"shooter", &"player", &"player", Vector2i(1, 1), [archer], Vector2i.RIGHT)
+	var friend = _squad(&"friend", &"player", &"player", Vector2i(2, 1), [_unit(&"f", &"custom", 0, 0, 5, 0, 1)])
+	var target = _squad(&"target", &"enemy", &"npc", Vector2i(3, 1), [
+		_unit(&"t1", &"custom", 0, 0, 5, 0, 1),
+		_unit(&"t2", &"custom", 1, 1, 4, 0, 1),
+	])
+	var shot = _resolve(Vector2i(6, 4), [], [shooter, friend, target], {
+		&"shooter": _skill(&"shooter", &"first_strike", &"archer"),
+	})
+	_expect_equal(shot.actor_state_for(&"target").unit_by_id(&"t1").health, 4, "first strike crosses friendly squads and damages every living target unit")
+	_expect_equal(shot.actor_state_for(&"target").unit_by_id(&"t2").health, 3, "first strike applies one damage to the whole target squad")
+	_expect_true(shot.actor_state_for(&"shooter").unit_by_id(&"archer").has_used_grid_skill(&"first_strike"), "first strike use is stored on its archer")
+
+	var assassin = _unit(&"assassin", &"assassin", 1, 1, 3, 2, 3)
+	var trapper = _squad(&"trapper", &"player", &"player", Vector2i(1, 1), [assassin])
+	var placed = _resolve(Vector2i(5, 4), [], [trapper], {
+		&"trapper": _skill(&"trapper", &"trap", &"assassin"),
+	})
+	_expect_equal(placed.final_map_effects["traps"].size(), 1, "trap persists on the map after placement")
+	var entrant = _squad(&"entrant", &"enemy", &"npc", Vector2i(0, 1), [
+		_unit(&"low", &"custom", 0, 0, 2, 0, 1),
+		_unit(&"high", &"custom", 1, 0, 5, 0, 1),
+	])
+	var triggered = _resolve(Vector2i(5, 4), [], [placed.actor_state_for(&"trapper"), entrant], {
+		&"entrant": _move(&"entrant", Vector2i.RIGHT),
+	}, 902, placed.final_map_effects)
+	_expect_equal(triggered.trap_events[0]["target_unit_id"], &"low", "trap targets the lowest absolute current HP unit")
+	_expect_equal(triggered.final_map_effects["traps"].size(), 0, "triggered trap is removed before collision combat")
+
+	var tank = _unit(&"guard", &"tank", 0, 0, 8, 0, 1)
+	var guarded = _squad(&"guarded", &"player", &"player", Vector2i(1, 1), [tank], Vector2i.LEFT)
+	var armed = _resolve(Vector2i(5, 4), [], [guarded], {
+		&"guarded": _skill(&"guarded", &"guard", &"guard"),
+	})
+	_expect_true(armed.actor_state_for(&"guarded").unit_by_id(&"guard").is_guard_armed(), "guard arms at the end of its activation turn")
+	var aggressor = _squad(&"aggressor", &"enemy", &"npc", Vector2i(2, 1), [_unit(&"a", &"custom", 0, 0, 20, 0, 2)], Vector2i.LEFT)
+	var guarded_fight = _resolve(Vector2i(5, 4), [], [armed.actor_state_for(&"guarded"), aggressor], {
+		&"aggressor": _move(&"aggressor", Vector2i.LEFT),
+	}, 903)
+	var engagement: Dictionary = guarded_fight.collision_waves[0]["groups"][0]["encounters"][0]["engagement"]
+	_expect_equal(
+		engagement.get("first_guard_advantage", 0) + engagement.get("second_guard_advantage", 0),
+		2, "guard adds exactly enough advantage to erase a disadvantage"
+	)
+	_expect_true(not guarded_fight.actor_state_for(&"guarded").unit_by_id(&"guard").is_guard_armed(), "guard is consumed only when it supplies advantage")
+
+
+func _test_volley_and_protection_auto_skills() -> void:
+	var archer = _unit(&"bow", &"archer", 1, 0, 3, 2, 5)
+	var archers = _squad(&"archers", &"player", &"player", Vector2i.ZERO, [archer])
+	var line = _squad(&"line", &"enemy", &"npc", Vector2i.ZERO, [
+		_unit(&"left", &"custom", 0, 0, 10, 0, 1),
+		_unit(&"middle", &"custom", 1, 0, 10, 0, 1),
+		_unit(&"right", &"custom", 2, 0, 10, 0, 1),
+	])
+	var volley := _battle(archers, line, 904)
+	var volley_events: Array = volley["events"].filter(func(event): return event.get("skill_id", &"") == &"volley")
+	_expect_equal(volley_events.size(), 3, "volley attacks the primary and every other living unit in its row")
+	_expect_equal(archers.unit_by_id(&"bow").resource_value(&"mp"), 2, "volley spends three MP once")
+	var solo_archer = _squad(&"solo_archer", &"player", &"player", Vector2i.ZERO, [
+		_unit(&"solo_bow", &"archer", 1, 0, 3, 2, 5),
+	])
+	var solo_target = _squad(&"solo_target", &"enemy", &"npc", Vector2i.ZERO, [
+		_unit(&"only", &"custom", 1, 0, 10, 0, 1),
+	])
+	var no_volley := _battle(solo_archer, solo_target, 906)
+	_expect_true(no_volley["events"].all(func(event): return event.get("skill_id", &"") != &"volley"), "volley does not trigger when the target row has no other enemy")
+	_expect_equal(solo_archer.unit_by_id(&"solo_bow").resource_value(&"mp"), 5, "failed volley condition preserves MP")
+
+	var tank = _unit(&"protector", &"tank", 0, 0, 8, 1, 5)
+	tank.gain_resource(&"tp", 2)
+	var ally = _unit(&"ally", &"custom", 1, 0, 5, 0, 1)
+	var protected_squad = _squad(&"protected", &"player", &"player", Vector2i.ZERO, [tank, ally])
+	var attacker = _unit(&"striker", &"custom", 1, 0, 20, 3, 4)
+	var enemy = _squad(&"enemy", &"enemy", &"npc", Vector2i.ZERO, [attacker])
+	var protection := _battle(protected_squad, enemy, 905)
+	var redirected: Array = protection["events"].filter(func(event): return event.get("protection_triggered", false))
+	_expect_equal(redirected.size(), 1, "a protection charge intercepts exactly one later attack")
+	_expect_equal(redirected[0]["intended_defender_unit_id"], &"ally", "protection keeps the original intended defender in metadata")
+	_expect_equal(redirected[0]["defender_unit_id"], &"protector", "the whole attack is redirected to the tank")
+	_expect_equal(protected_squad.unit_by_id(&"ally").health, 5, "protected ally takes no overflow damage")
+	var solo_tank_unit = _unit(&"solo_tank", &"tank", 0, 0, 8, 1, 5)
+	solo_tank_unit.gain_resource(&"tp", 2)
+	var solo_tank = _squad(&"solo_tank_squad", &"player", &"player", Vector2i.ZERO, [solo_tank_unit])
+	var solo_tank_enemy = _squad(&"solo_tank_enemy", &"enemy", &"npc", Vector2i.ZERO, [
+		_unit(&"tap", &"custom", 1, 0, 20, 0, 1),
+	])
+	var no_protection := _battle(solo_tank, solo_tank_enemy, 907)
+	_expect_true(no_protection["events"].all(func(event): return event.get("activated_skill_id", &"") != &"protect"), "protection does not activate without another living ally")
+	_expect_equal(solo_tank.unit_by_id(&"solo_tank").resource_value(&"tp"), 3, "solo tank spends no protection TP and still gains one TP from its attack")
+
+	var assassin = _squad(&"assassins", &"player", &"player", Vector2i.ZERO, [
+		_unit(&"knife", &"assassin", 1, 1, 3, 2, 5),
+	])
+	var mixed_health = _squad(&"mixed", &"enemy", &"npc", Vector2i.ZERO, [
+		_unit(&"front_low", &"custom", 2, 0, 2, 0, 1),
+		_unit(&"back_high", &"custom", 1, 1, 10, 0, 1),
+	])
+	var bullying := _battle(assassin, mixed_health, 908)
+	var bullying_event: Dictionary = bullying["events"].filter(func(event): return event.get("skill_id", &"") == &"bullying")[0]
+	_expect_equal(bullying_event["intended_defender_unit_id"], &"front_low", "bullying overrides back-row preference and selects the lowest current HP")
+	_expect_equal(assassin.unit_by_id(&"knife").resource_value(&"mp"), 3, "bullying spends two MP")
+	var lone_assassin = _squad(&"lone_assassin", &"player", &"player", Vector2i.ZERO, [
+		_unit(&"lone_knife", &"assassin", 1, 1, 3, 2, 5),
+	])
+	var lone_enemy = _squad(&"lone_enemy", &"enemy", &"npc", Vector2i.ZERO, [
+		_unit(&"last_enemy", &"custom", 1, 0, 10, 0, 1),
+	])
+	var no_bullying := _battle(lone_assassin, lone_enemy, 909)
+	_expect_true(no_bullying["events"].all(func(event): return event.get("skill_id", &"") != &"bullying"), "bullying does not trigger against a single living enemy")
+	_expect_equal(lone_assassin.unit_by_id(&"lone_knife").resource_value(&"mp"), 5, "failed bullying condition preserves MP")
+	var tie_targets: Array = []
+	for repetition in 2:
+		var tie_assassin = _squad(&"tie_assassin", &"player", &"player", Vector2i.ZERO, [
+			_unit(&"tie_knife", &"assassin", 1, 1, 3, 1, 5),
+		])
+		var tied_enemy = _squad(&"tied_enemy", &"enemy", &"npc", Vector2i.ZERO, [
+			_unit(&"tie_a", &"custom", 0, 0, 6, 0, 1),
+			_unit(&"tie_b", &"custom", 2, 1, 6, 0, 1),
+		])
+		var tie_result := _battle(tie_assassin, tied_enemy, 910)
+		tie_targets.append(tie_result["events"][0]["intended_defender_unit_id"])
+		_expect_true(tie_result["events"][0]["used_random_tie"], "bullying records a seeded random tie")
+	_expect_equal(tie_targets[0], tie_targets[1], "bullying tie selection is reproducible for the same seed")
+	var guard_tank = _unit(&"bully_guard", &"tank", 0, 0, 8, 0, 6)
+	guard_tank.gain_resource(&"tp", 2)
+	var guarded_victim = _unit(&"guarded_low", &"custom", 1, 0, 2, 0, 1)
+	var bully_defenders = _squad(&"bully_defenders", &"player", &"player", Vector2i.ZERO, [guard_tank, guarded_victim])
+	var bully_attacker = _squad(&"bully_attacker", &"enemy", &"npc", Vector2i.ZERO, [
+		_unit(&"enemy_knife", &"assassin", 1, 1, 3, 2, 5),
+	])
+	var protected_bullying := _battle(bully_defenders, bully_attacker, 911)
+	var protected_bully_events: Array = protected_bullying["events"].filter(func(event): return event.get("skill_id", &"") == &"bullying")
+	_expect_equal(protected_bully_events[0]["intended_defender_unit_id"], &"guarded_low", "bullying records its lowest-HP intended target before protection")
+	_expect_equal(protected_bully_events[0]["defender_unit_id"], &"bully_guard", "protection can redirect a bullying attack to the tank")
 
 
 func _test_battle_hardened_third_encounter_once() -> void:
@@ -245,11 +386,12 @@ func _test_front_and_back_row_preferences() -> void:
 	var assassin = _squad(&"player", &"player", &"player", Vector2i.ZERO, [
 		_unit(&"assassin", &"assassin", 1, 0, 20, 1, 5),
 	])
+	assassin.unit_by_id(&"assassin").spend_resource(&"mp", 4)
 	var target = _squad(&"enemy", &"enemy", &"npc", Vector2i.ZERO, [
 		_unit(&"front", &"custom", 1, 0, 20, 1, 1),
 		_unit(&"back", &"custom", 1, 1, 20, 1, 1),
 	])
-	_expect_equal(_battle(assassin, target, 1)["events"][0]["defender_unit_id"], &"back", "assassin prioritizes back row")
+	_expect_equal(_battle(assassin, target, 1)["events"][0]["defender_unit_id"], &"back", "assassin's normal attack prioritizes back row when bullying cannot trigger")
 
 
 func _test_empty_preferred_row_falls_back() -> void:
@@ -826,7 +968,8 @@ func _test_main_scene_gm_panel_and_combat() -> void:
 	await get_tree().create_timer(0.4).timeout
 	_expect_true(not main._busy, "selected bandage source completes a grid skill turn")
 	_expect_equal(main._actors[&"player"].unit_at(Vector2i(0, 0)).health, bandage_target.max_health, "grid bandage interaction heals the selected squad")
-	_expect_true(main._bandage_button.disabled, "bandage button disables after the map use is spent")
+	_expect_true(not main._bandage_button.disabled, "another warrior retains its own bandage use")
+	_expect_equal(main._bandage_button.text, "包扎 ×1", "bandage button reports remaining eligible warrior count")
 	await main._play_turn(_move(&"player", Vector2i.RIGHT))
 	await main._play_turn(_move(&"player", Vector2i.DOWN))
 	await main._play_turn(_move(&"player", Vector2i.RIGHT))
@@ -970,10 +1113,13 @@ func _battle(first, second, battle_seed: int, first_advantage: int = 0, second_a
 	return SquadBattleResolverType.resolve_round(first, second, rng, first_advantage, second_advantage)
 
 
-func _resolve(board_size: Vector2i, walls: Array, states: Array, intents: Dictionary, battle_seed: int = 1337):
+func _resolve(
+	board_size: Vector2i, walls: Array, states: Array, intents: Dictionary,
+	battle_seed: int = 1337, map_effects: Dictionary = {}
+):
 	var blocked := {}
 	for wall: Vector2i in walls: blocked[wall] = true
-	return TurnResolverType.resolve(board_size, blocked, states, intents, battle_seed)
+	return TurnResolverType.resolve(board_size, blocked, states, intents, battle_seed, map_effects)
 
 
 func _move(id: StringName, delta: Vector2i):

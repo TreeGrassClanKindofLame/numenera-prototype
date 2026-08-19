@@ -75,7 +75,16 @@ func preview_action(schedule_entry: Dictionary, event: Dictionary) -> void:
 	impact_flash = 0.0
 	target_died = event.get("target_died", false)
 	var phase_text := "第零回合" if event.get("phase", &"round_one") == &"round_zero" else "第一回合"
-	var action_name := "连击" if event.get("action_kind", &"normal_attack") == &"combo_attack" else "普通攻击"
+	var action_name := "普通攻击"
+	match event.get("action_kind", &"normal_attack"):
+		&"combo_attack": action_name = "连击"
+		&"volley_primary": action_name = "齐射·主目标"
+		&"volley_secondary": action_name = "齐射·同排目标"
+		&"bullying_attack": action_name = "欺凌"
+	if event.get("activated_skill_id", &"") == &"protect":
+		action_name = "保护启动＋" + action_name
+	if event.get("protection_triggered", false):
+		action_name += "（肉盾代受）"
 	if event.get("passive_ids", []).has(&"bloodied"):
 		action_name += "＋浴血"
 	var action_text: String = _target_reason_text(event) if slow_motion else "%s 准备攻击 %s" % [
@@ -114,14 +123,22 @@ func commit_action(event: Dictionary) -> void:
 		]
 	var resource_text := ""
 	if event.get("resource_id", &"") != &"":
-		resource_text = "｜TP %d→%d" % [
+		resource_text = "｜%s %d→%d" % [
+			String(event.get("resource_id", &"")).to_upper(),
 			event.get("resource_before", 0), event.get("resource_after", 0)
 		]
-	detail_text = "%s 造成 %s 点伤害%s%s" % [
+	var redirect_text := ""
+	if event.get("protection_triggered", false):
+		redirect_text = "｜原目标 %s，由 %s 代受" % [
+			String(event.get("intended_defender_unit_id", &"")),
+			String(event.get("protected_by_unit_id", &"")),
+		]
+	detail_text = "%s 造成 %s 点伤害%s%s%s" % [
 		_unit_display_name(event.get("attacker_squad_id", &""), event.get("attacker_unit_id", &"")),
 		damage_text,
 		"，目标阵亡" if event.get("target_died", false) else "",
 		resource_text,
+		redirect_text,
 	]
 	queue_redraw()
 
@@ -345,7 +362,12 @@ func _draw_action_queue() -> void:
 		draw_rect(rect, Color("3b516b"), false, 1.0)
 		var prefix := "▶" if state == &"current" else "×" if state == &"skipped" else "✓" if state == &"acted" else "%d" % (index + 1)
 		var phase_mark := "零" if entry.get("phase", &"round_one") == &"round_zero" else "一"
-		var action_mark := "连" if entry.get("action_kind", &"normal_attack") == &"combo_attack" else "攻"
+		var action_mark := "攻"
+		match entry.get("action_kind", &"normal_attack"):
+			&"combo_attack": action_mark = "连"
+			&"volley_primary": action_mark = "齐主"
+			&"volley_secondary": action_mark = "齐次"
+			&"bullying_attack": action_mark = "欺"
 		var label := "%s[%s·%s] %s　速%d" % [prefix, phase_mark, action_mark, _unit_display_name(entry.get("squad_id", &""), entry.get("unit_id", &"")), entry.get("speed", 0)]
 		draw_string(ThemeDB.fallback_font, rect.position + Vector2(8.0, 17.0), label, HORIZONTAL_ALIGNMENT_LEFT, 202.0, 12, text_color)
 		if state == &"skipped":
@@ -428,8 +450,9 @@ func _engagement_summary() -> String:
 			continue
 		var direction: int = data.get("%s_direction_advantage" % spec[1], total)
 		var class_bonus: int = data.get("%s_class_advantage" % spec[1], 0)
-		advantage_parts.append("%s 方向%d＋越战%d＝%d" % [
-			_squad_display_name(spec[0]), direction, class_bonus, total
+		var guard_bonus: int = data.get("%s_guard_advantage" % spec[1], 0)
+		advantage_parts.append("%s 方向%d＋越战%d＋戒备%d＝%d" % [
+			_squad_display_name(spec[0]), direction, class_bonus, guard_bonus, total
 		])
 	var verdict := "均无优势" if advantage_parts.is_empty() else "；".join(advantage_parts)
 	return "接敌：%s %s%d vs %s %s%d → %s" % [
