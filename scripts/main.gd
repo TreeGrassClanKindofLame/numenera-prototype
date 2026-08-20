@@ -1188,8 +1188,6 @@ func _format_turn_log(turn_index: int, intents: Dictionary, resolution) -> Strin
 						_actor_name(encounter["first_squad_id"]),
 						encounter["first_advantage"],
 					]
-					if engagement.get("first_class_advantage", 0) > 0:
-						advantage_text += "（含越战越勇1）"
 					if engagement.get("first_guard_advantage", 0) > 0:
 						advantage_text += "（戒备补%d）" % engagement["first_guard_advantage"]
 				elif encounter.get("second_advantage", 0) > 0:
@@ -1197,8 +1195,6 @@ func _format_turn_log(turn_index: int, intents: Dictionary, resolution) -> Strin
 						_actor_name(encounter["second_squad_id"]),
 						encounter["second_advantage"],
 					]
-					if engagement.get("second_class_advantage", 0) > 0:
-						advantage_text += "（含越战越勇1）"
 					if engagement.get("second_guard_advantage", 0) > 0:
 						advantage_text += "（戒备补%d）" % engagement["second_guard_advantage"]
 				lines.append("  接敌：%s%d vs %s%d → %s" % [
@@ -1221,8 +1217,6 @@ func _format_turn_log(turn_index: int, intents: Dictionary, resolution) -> Strin
 					action_text = "保护＋" + action_text
 				if event.get("protection_triggered", false):
 					action_text += "（保护承伤）"
-				if event.get("damage_bonus", 0) > 0:
-					action_text += "+浴血"
 				var resource_text := ""
 				if event.get("resource_id", &"") != &"":
 					resource_text = " %s%d→%d" % [

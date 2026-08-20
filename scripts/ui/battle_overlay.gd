@@ -148,10 +148,6 @@ func commit_action(event: Dictionary) -> void:
 		queue_redraw()
 		return
 	var damage_text := "%d" % event.get("damage", 0)
-	if event.get("damage_bonus", 0) > 0:
-		damage_text += "（基础%d＋浴血%d）" % [
-			event.get("base_damage", 0), event.get("damage_bonus", 0)
-		]
 	var resource_text := ""
 	if event.get("resource_id", &"") != &"":
 		resource_text = "｜%s %d→%d" % [

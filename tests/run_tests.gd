@@ -21,11 +21,10 @@ func _ready() -> void:
 func _run_all() -> void:
 	_test_class_stats_and_free_formation()
 	_test_class_resources_and_clone()
-	_test_tp_combo_and_bloodied_rules()
+	_test_tp_combo_rules()
 	_test_bandage_grid_skill_rules()
 	_test_new_grid_class_skills()
 	_test_volley_and_protection_auto_skills()
-	_test_battle_hardened_third_encounter_once()
 	_test_front_and_back_row_preferences()
 	_test_empty_preferred_row_falls_back()
 	_test_facing_column_then_nearest_column()
@@ -66,7 +65,7 @@ func _run_all() -> void:
 	await get_tree().create_timer(0.15).timeout
 
 	if _failures == 0:
-		print("PASS: %d checks across 41 gameplay scenarios." % _checks)
+		print("PASS: %d checks across 40 gameplay scenarios." % _checks)
 		get_tree().quit(0)
 	else:
 		push_error("FAIL: %d of %d checks failed." % [_failures, _checks])
@@ -116,7 +115,7 @@ func _test_class_resources_and_clone() -> void:
 	_expect_true(SquadBattleResolverType.formation_snapshot(tank_squad, training_target)[&"tank_squad"][0]["resources"].has(&"tp"), "formation snapshots include resources")
 
 
-func _test_tp_combo_and_bloodied_rules() -> void:
+func _test_tp_combo_rules() -> void:
 	var warrior_unit = _unit(&"w", &"warrior", 1, 0, 10, 2, 5)
 	warrior_unit.health = 4
 	warrior_unit.gain_resource(&"tp", 4)
@@ -133,7 +132,7 @@ func _test_tp_combo_and_bloodied_rules() -> void:
 	_expect_equal(result["turn_schedule"][0]["action_kind"], &"combo_action", "combo uses one summarized unit-turn queue entry")
 	_expect_equal(result["turn_schedule"][0]["event_indices"].size(), 2, "combo queue entry owns both strike events")
 	_expect_equal(warrior_attacks[0]["action_kind"], &"combo_attack", "combo attack resolves before the planned attack")
-	_expect_equal([warrior_attacks[0]["damage"], warrior_attacks[1]["damage"]], [3, 3], "bloodied adds damage to combo and normal attacks")
+	_expect_equal([warrior_attacks[0]["damage"], warrior_attacks[1]["damage"]], [2, 2], "combo and normal attacks both use base warrior damage")
 	_expect_equal(warriors.unit_by_id(&"w").resource_value(&"tp"), 2, "combo spends four TP and both attacks recharge one")
 
 	var repeated_unit = _unit(&"rw", &"warrior", 1, 0, 20, 1, 5)
@@ -160,15 +159,6 @@ func _test_tp_combo_and_bloodied_rules() -> void:
 	_expect_true(lethal_combo_result["events"][1]["missed"], "combo second strike misses after its locked target dies")
 	_expect_equal(remaining_targets.unit_by_id(&"other_target").health, 20, "missed combo strike never transfers to another target")
 	_expect_equal(lethal_combo.unit_by_id(&"lethal_combo").resource_value(&"tp"), 1, "missed combo strike grants no attack TP")
-
-	var half_unit = _unit(&"half", &"warrior", 1, 0, 4, 2, 5)
-	half_unit.health = 2
-	var half = _squad(&"half_squad", &"player", &"player", Vector2i.ZERO, [half_unit])
-	var half_target = _squad(&"half_enemy", &"enemy", &"npc", Vector2i.ZERO, [
-		_unit(&"half_target", &"custom", 1, 0, 20, 0, 1),
-	])
-	_expect_equal(_battle(half, half_target, 73)["events"][0]["damage"], 2, "exactly fifty percent health does not trigger bloodied")
-
 
 func _test_bandage_grid_skill_rules() -> void:
 	var source = _unit(&"source", &"warrior", 1, 0, 5, 2, 2)
@@ -353,42 +343,6 @@ func _test_volley_and_protection_auto_skills() -> void:
 	var protected_bully_events: Array = protected_bullying["events"].filter(func(event): return event.get("skill_id", &"") == &"bullying")
 	_expect_equal(protected_bully_events[0]["intended_defender_unit_id"], &"guarded_low", "bullying records its lowest-HP intended target before protection")
 	_expect_equal(protected_bully_events[0]["defender_unit_id"], &"bully_guard", "protection can redirect a bullying attack to the tank")
-
-
-func _test_battle_hardened_third_encounter_once() -> void:
-	var player = _squad(&"player", &"player", &"player", Vector2i(1, 1), [
-		_unit(&"pw", &"warrior", 1, 0, 50, 0, 2),
-	], Vector2i.RIGHT)
-	var enemy = _squad(&"enemy", &"enemy", &"npc", Vector2i(2, 1), [
-		_unit(&"ew", &"warrior", 1, 0, 50, 0, 1),
-	], Vector2i.LEFT)
-	var class_advantages: Array = []
-	for turn_index in 4:
-		var resolution = _resolve(Vector2i(5, 4), [], [player, enemy], {
-			&"player": _move(&"player", Vector2i.RIGHT),
-			&"enemy": _wait(&"enemy"),
-		}, 80 + turn_index)
-		var encounter: Dictionary = resolution.collision_waves[0]["groups"][0]["encounters"][0]
-		class_advantages.append([
-			encounter["engagement"].get("first_class_advantage", 0),
-			encounter["engagement"].get("second_class_advantage", 0),
-		])
-		player = resolution.actor_state_for(&"player")
-		enemy = resolution.actor_state_for(&"enemy")
-	_expect_equal(class_advantages, [[0, 0], [0, 0], [1, 1], [0, 0]], "battle hardened grants both squads one advantage only on their third encounter")
-	_expect_true(player.map_passive_state.get(&"battle_hardened_used", false), "battle hardened remains consumed for the map")
-	var dead_warrior = _unit(&"dead_w", &"warrior", 0, 0, 5, 0, 1)
-	dead_warrior.health = 0
-	var no_source = _squad(&"no_source", &"player", &"player", Vector2i(1, 1), [
-		dead_warrior, _unit(&"living", &"custom", 1, 0, 20, 0, 1),
-	])
-	var other = _squad(&"other", &"enemy", &"npc", Vector2i(2, 1), [
-		_unit(&"other_u", &"custom", 1, 0, 20, 0, 1),
-	])
-	var no_source_result = _resolve(Vector2i(5, 4), [], [no_source, other], {
-		&"no_source": _move(&"no_source", Vector2i.RIGHT), &"other": _wait(&"other"),
-	}, 85)
-	_expect_equal(no_source_result.actor_state_for(&"no_source").map_passive_state.get(&"battle_hardened_count", 0), 0, "dead warriors do not advance battle hardened")
 
 
 func _test_front_and_back_row_preferences() -> void:

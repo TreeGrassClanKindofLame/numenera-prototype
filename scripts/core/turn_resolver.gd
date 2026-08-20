@@ -17,9 +17,6 @@ const FACILITY_CANNON := &"electromagnetic_cannon"
 const MEDICAL_HEAL := 10
 const MEDICAL_MP_GAIN := 10
 const CANNON_DAMAGE := 3
-const PASSIVE_BATTLE_HARDENED_COUNT := &"battle_hardened_count"
-const PASSIVE_BATTLE_HARDENED_USED := &"battle_hardened_used"
-
 const VALID_DELTAS := [
 	Vector2i.UP,
 	Vector2i.DOWN,
@@ -316,16 +313,8 @@ static func _resolve_collision_wave(
 			var engagement := _build_engagement(
 				first_id, second_id, center, last_sources, states
 			)
-			var first_had_warrior: bool = first.has_living_class(SquadUnitStateType.CLASS_WARRIOR)
-			var second_had_warrior: bool = second.has_living_class(SquadUnitStateType.CLASS_WARRIOR)
-			var first_class_advantage := _battle_hardened_bonus(first)
-			var second_class_advantage := _battle_hardened_bonus(second)
 			engagement["first_direction_advantage"] = engagement["first_advantage"]
 			engagement["second_direction_advantage"] = engagement["second_advantage"]
-			engagement["first_class_advantage"] = first_class_advantage
-			engagement["second_class_advantage"] = second_class_advantage
-			engagement["first_advantage"] += first_class_advantage
-			engagement["second_advantage"] += second_class_advantage
 			var guard_result := _apply_guard_advantage(first, second, engagement)
 			engagement.merge(guard_result, true)
 			var encounter: Dictionary = SquadBattleResolverType.resolve_round(
@@ -336,8 +325,6 @@ static func _resolve_collision_wave(
 				engagement["second_advantage"],
 				engagement
 			)
-			_record_battle_hardened_encounter(first, first_had_warrior)
-			_record_battle_hardened_encounter(second, second_had_warrior)
 			encounter["pair_index"] = pair_index
 			encounter["skipped"] = false
 			for unit_event: Dictionary in encounter["events"]:
@@ -1054,26 +1041,6 @@ static func _next_guard_order(states: Dictionary) -> int:
 			if unit.is_guard_armed():
 				order = maxi(order, unit.guard_order() + 1)
 	return order
-
-
-static func _battle_hardened_bonus(squad) -> int:
-	if not squad.has_living_class(SquadUnitStateType.CLASS_WARRIOR):
-		return 0
-	if squad.map_passive_state.get(PASSIVE_BATTLE_HARDENED_USED, false):
-		return 0
-	if squad.map_passive_state.get(PASSIVE_BATTLE_HARDENED_COUNT, 0) < 2:
-		return 0
-	squad.map_passive_state[PASSIVE_BATTLE_HARDENED_USED] = true
-	return 1
-
-
-static func _record_battle_hardened_encounter(squad, had_living_warrior: bool) -> void:
-	if not had_living_warrior:
-		return
-	if squad.map_passive_state.get(PASSIVE_BATTLE_HARDENED_USED, false):
-		return
-	var count: int = squad.map_passive_state.get(PASSIVE_BATTLE_HARDENED_COUNT, 0)
-	squad.map_passive_state[PASSIVE_BATTLE_HARDENED_COUNT] = mini(count + 1, 2)
 
 
 static func _contact_info(

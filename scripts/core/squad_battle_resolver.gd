@@ -6,7 +6,6 @@ const SKILL_COMBO := &"combo"
 const SKILL_VOLLEY := &"volley"
 const SKILL_PROTECT := &"protect"
 const SKILL_BULLY := &"bullying"
-const PASSIVE_BLOODIED := &"bloodied"
 const COMBO_TP_COST := 4
 const VOLLEY_MP_COST := 3
 const PROTECT_TP_COST := 2
@@ -323,15 +322,7 @@ static func _resolve_attack(
 		resource_before = options["resource_before"]
 	if options.has("resource_spent"):
 		resource_spent = options["resource_spent"]
-	var damage_bonus := 0
-	var passive_ids: Array = []
-	if (
-		attacker.unit_class == SquadUnitStateType.CLASS_WARRIOR
-		and attacker.health * 2 < attacker.max_health
-	):
-		damage_bonus = 1
-		passive_ids.append(PASSIVE_BLOODIED)
-	var damage: int = attacker.attack + damage_bonus
+	var damage: int = attacker.attack
 	target.health -= damage
 	defending_squad.sync_summary_stats()
 	var tp_gained: int = attacker.gain_resource(SquadUnitStateType.RESOURCE_TP, 1)
@@ -344,7 +335,6 @@ static func _resolve_attack(
 		"skill_id": skill_id,
 		"strike_status": &"hit",
 		"missed": false,
-		"passive_ids": passive_ids,
 		"attacker_squad_id": acting_squad.actor_id,
 		"defender_squad_id": defending_squad.actor_id,
 		"attacker_unit_id": attacker.unit_id,
@@ -357,8 +347,6 @@ static func _resolve_attack(
 		"attacker_slot": attacker.slot,
 		"defender_slot": target.slot,
 		"speed": attacker.speed,
-		"base_damage": attacker.attack,
-		"damage_bonus": damage_bonus,
 		"damage": damage,
 		"health_before": health_before,
 		"health_after": target.health,
@@ -404,7 +392,6 @@ static func _append_missed_strike(
 		"skill_id": SKILL_COMBO,
 		"strike_status": &"missed_dead_target",
 		"missed": true,
-		"passive_ids": [],
 		"attacker_squad_id": acting_squad.actor_id,
 		"defender_squad_id": defending_squad.actor_id,
 		"attacker_unit_id": attacker.unit_id,
@@ -417,8 +404,6 @@ static func _append_missed_strike(
 		"attacker_slot": attacker.slot,
 		"defender_slot": target_slot,
 		"speed": attacker.speed,
-		"base_damage": attacker.attack,
-		"damage_bonus": 0,
 		"damage": 0,
 		"health_before": target_health,
 		"health_after": target_health,
